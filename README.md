@@ -167,8 +167,7 @@ Stdlib `minitest`, no Gemfile/bundle. The helper scripts guard their
 `main` with `if $PROGRAM_NAME == __FILE__`, so the suite `load`s a script
 and exercises its pure methods directly.
 
-- `test/ingress_stamping_test.rb` — ported from `mail_on_rails_smtp`'s
-  test of the same trust boundary (there, `IngressClient#stamp`): forged
+- `test/ingress_stamping_test.rb` — test of trust boundary: forged
   `X-Original-To` / `Return-Path` / `X-MailOnRails-*` headers must be
   stripped in every shape (folded, mixed-case, bare-LF), body occurrences
   left alone, and no envelope/connection value (sender, recipient, IP,
@@ -181,10 +180,6 @@ and exercises its pure methods directly.
 - `test/auth_check_test.rb` — AUTH is granted only on a 2xx with a
   non-null `account_id`; base64 arg-wrapping round-trips passwords with
   spaces; malformed/`null`/non-2xx responses deny.
-
-The other `mail_on_rails_smtp` suites cover daemon internals this project
-doesn't have (SMTP session, scheduler, worker Ractors, conn/rate limiters,
-SPF/DKIM/DMARC, clamd) and don't port.
 
 ## Deploy with Kamal
 
