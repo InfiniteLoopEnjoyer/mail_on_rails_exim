@@ -1,0 +1,194 @@
+######################################################################
+# mail_on_rails_exim - Exim mail edge for the mail_on_rails app.
+#
+# Rendered to /etc/exim4/exim4.conf at container start by bin/entrypoint,
+# which substitutes the @@EXIM_*@@ placeholders (Exim's own $variables and
+# ${expansions} are left untouched). The Ruby helper scripts (bin/*) do
+# the HTTP work; Exim invokes them as `/usr/local/bin/ruby <script>`.
+#
+# Flow:
+#   - Inbound (:25) and authenticated submission to a local domain -> the
+#     app's Action Mailbox relay ingress (bin/rails-ingress). Rails matches
+#     recipients to accounts, drops the rest, and scans for viruses/spam.
+#   - Authenticated submission to a REMOTE domain -> queued in the app via
+#     the internal API (bin/rails-outbound); the app DKIM-signs and sends.
+#     This is the only path that leaves for another server and it requires
+#     a valid login, so accepting all recipients is NOT an open relay.
+#   - AUTH credentials are checked against the app's internal API
+#     (bin/auth-check), offered only over TLS and never on port 25.
+#
+# Trust / secrets: this file holds no secrets - the Ruby helpers read
+# INGRESS_PASSWORD / INTERNAL_API_PASSWORD from the environment (passed to
+# child processes via keep_environment). The app's mailroom TRUSTS
+# X-Original-To / Return-Path / X-MailOnRails-* headers, so bin/rails-ingress
+# strips any forged copies before stamping the authoritative ones. The
+# rails_ingress transport also forwards the live-connection facts the app
+# can't otherwise see - the client IP ($sender_host_address) and HELO name
+# ($sender_helo_name) - so the app can run SPF/DKIM/DMARC (rspamd) itself.
+# Do not remove the stripping step.
+######################################################################
+
+#### Main configuration ##############################################
+
+primary_hostname = @@EXIM_HELO_HOST@@
+
+# Domains we host. Used to tell, for an authenticated submission, a local
+# recipient (-> ingress) from a remote one (-> queue outbound), so mail to
+# our own users isn't looped back out through our MX.
+domainlist local_domains = @@EXIM_LOCAL_DOMAINS@@
+
+# Listeners. Kamal publishes host 25/587/465 -> these container ports 1:1
+# (proxy: false in config/deploy.yml). 465 is implicit TLS.
+daemon_smtp_ports = 25 : 587 : 465
+tls_on_connect_ports = 465
+
+# TLS material (Let's Encrypt, mounted read-only). When unset (dev), TLS
+# is simply not advertised, which also means AUTH is not offered.
+tls_certificate = @@EXIM_TLS_CERT@@
+tls_privatekey  = @@EXIM_TLS_KEY@@
+tls_advertise_hosts = ${if eq{@@EXIM_TLS_CERT@@}{}{}{*}}
+
+# Match the app's 25 MB message cap.
+message_size_limit = 26214400
+
+# --- Abuse / DoS limits ------------------------------------------------
+# Exim accepts every message and forwards each one to Rails (a Ruby spawn
+# + HTTP POST per message), and every AUTH attempt spawns a check too, so
+# bound the funnel. Tune to your real traffic.
+# Concurrent inbound connections total / per source IP; messages per
+# connection. (Exim has no inline comments, so these ride above the lines.)
+smtp_accept_max                = 100
+smtp_accept_max_per_host       = 10
+smtp_accept_max_per_connection = 50
+# RCPTs per message - each becomes one X-Original-To in the ingress POST.
+recipients_max                 = 100
+# Cap the header block; mail-loop protection.
+header_maxsize                 = 1M
+received_headers_max           = 30
+
+# Don't advertise the Exim version in the banner.
+smtp_banner = $smtp_active_hostname ESMTP
+
+# TLS protocol floor. bin/entrypoint fills this in with the right directive
+# for this build's TLS library (OpenSSL vs GnuTLS), or leaves it empty and
+# relies on Exim's defaults if the library can't be detected.
+@@EXIM_TLS_HARDENING@@
+
+# Cleaned child environment: only these names reach the Ruby helpers.
+# Exim empties the env for everything else by default.
+keep_environment = INGRESS_URL : INGRESS_PASSWORD : INTERNAL_API_URL : INTERNAL_API_PASSWORD
+add_environment  = <; PATH=/usr/local/bin:/usr/bin:/bin
+
+# Log to the container's stdout so `kamal logs` / `docker logs` see it.
+log_file_path = /dev/stdout
+
+acl_smtp_rcpt = acl_rcpt
+acl_smtp_auth = acl_auth
+
+
+#### ACL #############################################################
+
+begin acl
+
+acl_rcpt:
+  # Per-IP recipient rate limit - dictionary/flood control. Authenticated
+  # submitters are exempt (a person's client, not a flood source).
+  defer  message        = rate limit exceeded, slow down
+         !authenticated  = *
+         ratelimit       = 100 / 1h / per_rcpt / strict / $sender_host_address
+
+  # Accept every recipient. Rails decides what maps to a local account and
+  # drops the rest. Safe: unauthenticated mail is only ever handed to the
+  # inbound ingress by the routers below - never queued outbound.
+  accept
+
+# Throttle AUTH attempts per IP - each one spawns a Ruby check against the
+# app, so this caps both brute force and its amplification.
+acl_auth:
+  defer  message   = too many authentication attempts, try later
+         ratelimit = 10 / 1m / strict / $sender_host_address
+  accept
+
+
+#### Routers #########################################################
+
+begin routers
+
+# The ONLY path that leaves for another mail server: an authenticated
+# submitter sending to a domain we don't host. Queue it in the app, which
+# DKIM-signs and delivers to the recipient's MX. Unauthenticated senders
+# never match this (no $authenticated_id), so Exim is not an open relay.
+submission_outbound:
+  driver    = accept
+  condition = ${if def:authenticated_id}
+  domains   = ! +local_domains
+  transport = rails_outbound
+
+# Everything else -> the app's relay ingress: all inbound mail (any
+# recipient) and authenticated submission to local domains.
+rails_ingress:
+  driver    = accept
+  transport = rails_ingress
+
+
+#### Transports ######################################################
+
+begin transports
+
+# One pipe invocation per message (batch_max) carrying every recipient in
+# $pipe_addresses, so the ingress is POSTed exactly once with an
+# X-Original-To per recipient. Raw message on stdin, unaltered by Exim.
+rails_ingress:
+  driver         = pipe
+  command        = /usr/local/bin/ruby /usr/local/bin/rails-ingress sender=$sender_address auth=$authenticated_id ip=$sender_host_address helo=${base64:$sender_helo_name} $pipe_addresses
+  batch_max      = 100
+  use_shell      = false
+  message_prefix =
+  message_suffix =
+  return_fail_output = true
+  user           = Debian-exim
+  group          = Debian-exim
+
+rails_outbound:
+  driver         = pipe
+  command        = /usr/local/bin/ruby /usr/local/bin/rails-outbound sender=$sender_address auth=$authenticated_id $pipe_addresses
+  batch_max      = 100
+  use_shell      = false
+  message_prefix =
+  message_suffix =
+  return_fail_output = true
+  user           = Debian-exim
+  group          = Debian-exim
+
+
+#### Retry ###########################################################
+
+begin retry
+
+# Deferred (exit 75) handoffs: retry like a normal MTA before giving up.
+*   *   F,2h,15m; G,16h,1h,1.5; F,4d,6h
+
+
+#### Authenticators ##################################################
+
+begin authenticators
+
+# Credentials are verified against the app's internal API (bin/auth-check).
+# Only offered once TLS is up and never on port 25 (MX). auth values are
+# base64-wrapped through ${run} so passwords with spaces survive Exim's
+# whitespace-split of the command line.
+
+plain:
+  driver                     = plaintext
+  public_name                = PLAIN
+  server_condition           = ${run{/usr/local/bin/ruby /usr/local/bin/auth-check ${base64:$auth2} ${base64:$auth3}}{yes}{no}}
+  server_set_id              = $auth2
+  server_advertise_condition = ${if and{{def:tls_in_cipher}{!eq{$received_port}{25}}}{yes}{no}}
+
+login:
+  driver                     = plaintext
+  public_name                = LOGIN
+  server_prompts             = Username:: : Password::
+  server_condition           = ${run{/usr/local/bin/ruby /usr/local/bin/auth-check ${base64:$auth1} ${base64:$auth2}}{yes}{no}}
+  server_set_id              = $auth1
+  server_advertise_condition = ${if and{{def:tls_in_cipher}{!eq{$received_port}{25}}}{yes}{no}}

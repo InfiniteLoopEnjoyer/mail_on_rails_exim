@@ -1,0 +1,112 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Hand an accepted message to the app's Action Mailbox relay ingress.
+# Invoked by the rails_ingress pipe transport once per message:
+#
+#   rails-ingress sender=<envelope-from> auth=<authenticated_id> \
+#                 ip=<client-ip> helo=<base64 HELO> <rcpt>...
+#
+# with the raw RFC822 message on stdin.
+#
+# The app's mailroom TRUSTS X-Original-To / Return-Path / X-MailOnRails-*
+# headers, so any forged copy in the submitted message is stripped here
+# before we stamp the authoritative values that only the live SMTP
+# connection knows:
+#   - X-Original-To per envelope recipient (so BCC'd/aliased recipients
+#     still route);
+#   - X-MailOnRails-Authenticated (the SMTP-AUTH identity, or "no");
+#   - X-MailOnRails-Client-Ip / X-MailOnRails-Helo - the connecting IP and
+#     HELO name, forwarded so the app can run SPF/DKIM/DMARC (rspamd) even
+#     though it never sees the connection. (helo is base64 on the command
+#     line so an attacker-chosen HELO can't inject extra arguments.)
+# Exit codes: 0 accepted, 1 permanent (bounce), 75 temporary (Exim retries).
+#
+# The trust-boundary logic (RailsIngress.stamp) is pure and covered by
+# test/ingress_stamping_test.rb; #main runs only when executed directly.
+
+require "net/http"
+require "uri"
+
+module RailsIngress
+  TEMPFAIL = 75
+  # Headers a remote sender must not be able to forge; we set them ourselves.
+  TRUSTED = /\A(X-Original-To|X-MailOnRails-[\w-]+|Return-Path):/i
+
+  # Drop CR/LF so an envelope/connection value can't inject extra header lines.
+  def self.sanitize(value)
+    value.to_s.gsub(/[\r\n]/, " ")
+  end
+
+  # Strip the trusted headers from the submitted message (header block only),
+  # keeping folded continuation lines with their header.
+  def self.strip_trusted(raw)
+    header_block, separator, body = raw.partition(/\r?\n\r?\n/)
+    kept = header_block.split(/\r?\n(?![ \t])/).reject { |line| line.match?(TRUSTED) }
+    kept.join("\r\n") + separator + body
+  end
+
+  # The trust boundary: forged trusted headers stripped, authoritative ones
+  # prepended. Pure - no network, no ENV - so it is unit-testable.
+  def self.stamp(raw, sender:, auth:, ip:, helo:, rcpts:)
+    stamped = +""
+    stamped << "Return-Path: <#{sanitize(sender)}>\r\n" unless sender.to_s.empty?
+    Array(rcpts).each { |rcpt| stamped << "X-Original-To: #{sanitize(rcpt)}\r\n" }
+    stamped << "X-MailOnRails-Authenticated: #{auth.to_s.empty? ? 'no' : sanitize(auth)}\r\n"
+    stamped << "X-MailOnRails-Client-Ip: #{sanitize(ip)}\r\n" unless ip.to_s.empty?
+    stamped << "X-MailOnRails-Helo: #{sanitize(helo)}\r\n" unless helo.to_s.empty?
+    stamped + strip_trusted(raw)
+  end
+
+  def self.parse_args(argv)
+    parsed = { sender: "", auth: "", ip: "", helo: "", rcpts: [] }
+    argv.each do |arg|
+      case arg
+      when /\Asender=/ then parsed[:sender] = arg.sub(/\Asender=/, "")
+      when /\Aauth=/   then parsed[:auth]   = arg.sub(/\Aauth=/, "")
+      when /\Aip=/     then parsed[:ip]     = arg.sub(/\Aip=/, "")
+      when /\Ahelo=/   then parsed[:helo]   = arg.sub(/\Ahelo=/, "").unpack1("m").to_s
+      else parsed[:rcpts] << arg
+      end
+    end
+    parsed
+  end
+
+  def self.post(url, password, body)
+    uri = URI(url)
+    request = Net::HTTP::Post.new(uri)
+    request.basic_auth("actionmailbox", password)
+    request.content_type = "message/rfc822"
+    request.body = body
+    Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https",
+                    open_timeout: 5, read_timeout: 120, write_timeout: 120,
+                    min_version: :TLS1_2) { |http| http.request(request) }
+  end
+
+  # Returns the process exit code.
+  def self.main(argv, stdin)
+    url = ENV["INGRESS_URL"].to_s
+    password = ENV["INGRESS_PASSWORD"].to_s
+    if url.empty? || password.empty?
+      warn "rails-ingress: INGRESS_URL / INGRESS_PASSWORD unset"
+      return TEMPFAIL
+    end
+
+    message = stamp(stdin.binmode.read, **parse_args(argv))
+
+    begin
+      response = post(url, password, message)
+    rescue StandardError => e
+      warn "rails-ingress: #{e.class}: #{e.message}"
+      return TEMPFAIL
+    end
+
+    case response
+    when Net::HTTPSuccess     then 0
+    when Net::HTTPClientError then warn "rails-ingress: ingress refused (#{response.code})"; 1
+    else                           warn "rails-ingress: ingress error (#{response.code})"; TEMPFAIL
+    end
+  end
+end
+
+exit RailsIngress.main(ARGV, $stdin) if $PROGRAM_NAME == __FILE__

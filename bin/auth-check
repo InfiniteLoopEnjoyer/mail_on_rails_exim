@@ -1,0 +1,67 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# SMTP AUTH credential check, called from the plaintext authenticators:
+#
+#   auth-check <base64 email> <base64 password>
+#
+# The credentials arrive base64-wrapped because Exim splits the ${run}
+# command on whitespace, so a raw password with a space would be mangled.
+# They are verified against the app's internal API. Exit 0 = valid,
+# non-zero = denied.
+#
+# The pure bits (decode, authenticated?) are covered by
+# test/auth_check_test.rb; #main runs only when executed directly.
+
+require "net/http"
+require "uri"
+require "json"
+
+module AuthCheck
+  # Decode one base64 command-line argument back to its plaintext.
+  def self.decode(arg)
+    arg.to_s.unpack1("m").to_s
+  end
+
+  # The internal API answers 200 with account_id:null on bad credentials,
+  # and 401 only when our own API password is wrong. Valid iff 2xx with a
+  # non-null account_id. Pure.
+  def self.authenticated?(code, body)
+    return false unless (200..299).cover?(code.to_i)
+
+    !JSON.parse(body.to_s)["account_id"].nil?
+  rescue JSON::ParserError
+    false
+  end
+
+  def self.post(base, api_password, email, password)
+    uri = URI("#{base.to_s.sub(%r{/\z}, '')}/authenticate")
+    request = Net::HTTP::Post.new(uri)
+    request.basic_auth("mail_on_rails", api_password)
+    request.set_form_data(email: email, password: password)
+    Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https",
+                    open_timeout: 5, read_timeout: 10, write_timeout: 10,
+                    min_version: :TLS1_2) { |http| http.request(request) }
+  end
+
+  # Returns the process exit code (0 valid, 1 denied).
+  def self.main(argv)
+    email = decode(argv[0])
+    password = decode(argv[1])
+    return 1 if email.empty? || password.empty?
+
+    base = ENV["INTERNAL_API_URL"].to_s
+    api_password = ENV["INTERNAL_API_PASSWORD"].to_s
+    return 1 if base.empty? || api_password.empty?
+
+    begin
+      response = post(base, api_password, email, password)
+    rescue StandardError
+      return 1
+    end
+
+    authenticated?(response.code, response.body) ? 0 : 1
+  end
+end
+
+exit AuthCheck.main(ARGV) if $PROGRAM_NAME == __FILE__

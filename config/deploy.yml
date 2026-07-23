@@ -1,0 +1,81 @@
+<% require "dotenv"; Dotenv.load(".env") %>
+
+# The Exim mail edge as its own Kamal service, deployed independently of
+# the host Rails app: `bin/kamal deploy`. Runs Exim (MX + authenticated
+# submission) with NO Rails and NO database. Exim hands mail to the app
+# over HTTP: inbound mail and authenticated local submission go to its
+# Action Mailbox relay ingress; authenticated outbound submission is
+# queued via the private API; AUTH is checked against the private API. The
+# app does account matching, virus scanning, rspamd filtering, and the
+# actual outbound send. If the app is down, sessions answer temporary
+# failures and sending servers retry.
+#
+# The container holds no RAILS_MASTER_KEY and no database credentials.
+service: mail_on_rails_exim
+image: mail_on_rails_exim
+
+servers:
+  mail:
+    hosts:
+      - 192.168.0.1
+    # kamal-proxy only speaks HTTP/HTTPS - Exim's listeners publish
+    # straight off the container. Kamal boots the new container before
+    # stopping the old one, which would clash on these ports, so
+    # .kamal/hooks/pre-app-boot stops the old one first (a few seconds of
+    # SMTP downtime per deploy; peers retry).
+    proxy: false
+    options:
+      publish:
+        - "25:25"     # SMTP MX (inbound, STARTTLS)
+        - "587:587"   # submission (STARTTLS, AUTH)
+        - "465:465"   # submission (implicit TLS, AUTH)
+
+primary_role: mail
+
+# Any registry both the build machine and the servers can reach.
+registry:
+  server: registry.example.com
+
+env:
+  secret:
+    # HTTP credentials for the calls to the app, from the gitignored .env
+    # (see .kamal/secrets-common). Deliberately NO RAILS_MASTER_KEY and NO
+    # database env in this container.
+    - INGRESS_PASSWORD          # action_mailbox.ingress_password
+    - INTERNAL_API_PASSWORD     # mail_on_rails.internal_api_password
+  clear:
+    # This host's public mail name (banner/EHLO); should match its PTR.
+    EXIM_HELO_HOST: mail.example.com
+
+    # Domains we host, ':' separated (Exim list syntax). Used to split
+    # authenticated submission into local (-> ingress) vs remote
+    # (-> outbound). Defaults to EXIM_HELO_HOST if unset.
+    EXIM_LOCAL_DOMAINS: example.com : example.net
+
+    # Inbound + local submission are POSTed to the app's relay ingress;
+    # AUTH checks and outbound queueing go to the internal API. If the app
+    # is down the session answers a temporary failure.
+    INGRESS_URL: https://app.example.com/rails/action_mailbox/relay/inbound_emails
+    INTERNAL_API_URL: https://app.example.com/mail_on_rails/internal
+
+    # TLS material for the listeners (Let's Encrypt). Renewals are picked
+    # up on the next connection - Exim re-reads the files per session.
+    # Leave unset to run without TLS (dev only; AUTH is then not offered).
+    EXIM_TLS_CERT: /etc/letsencrypt/live/mail.example.com/fullchain.pem
+    EXIM_TLS_KEY: /etc/letsencrypt/live/mail.example.com/privkey.pem
+
+# Virus scanning (ClamAV) and spam filtering (rspamd) live with the Rails
+# app, not here - define those accessories in the app's own
+# config/deploy.yml. This service runs only Exim.
+
+aliases:
+  logs: app logs -f
+  shell: app exec --interactive --reuse "bash"
+
+volumes:
+  # Mounted at the letsencrypt root (not live/) because live/*.pem are
+  # symlinks into ../../archive/.
+  - "/etc/letsencrypt:/etc/letsencrypt:ro"
+
+builder:
+  arch: amd64

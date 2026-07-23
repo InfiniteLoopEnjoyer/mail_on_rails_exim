@@ -1,0 +1,75 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Render the Exim config from its @@PLACEHOLDER@@ template and start the
+# daemon in the foreground as PID 1. Invoked as `ruby entrypoint` (see the
+# Dockerfile ENTRYPOINT).
+#
+# TLS floor: the right directive differs by build (OpenSSL vs GnuTLS), so
+# we render once, ask `exim4 -bV` which library this is, then re-render
+# with the matching @@EXIM_TLS_HARDENING@@ (empty if undetected).
+
+require "etc"
+
+CONF = "/etc/exim4/exim4.conf"
+TEMPLATE = "/etc/exim4/exim4.conf.template"
+ALLOWED = %w[EXIM_HELO_HOST EXIM_LOCAL_DOMAINS EXIM_TLS_CERT EXIM_TLS_KEY EXIM_TLS_HARDENING].freeze
+
+%w[EXIM_HELO_HOST INGRESS_URL INGRESS_PASSWORD].each do |key|
+  abort "entrypoint: #{key} is not set" if ENV[key].to_s.strip.empty?
+end
+
+# Needed only for authenticated submission (AUTH + outbound). Inbound still
+# works without them; AUTH just gets denied if a client tries it.
+if ENV["INTERNAL_API_URL"].to_s.strip.empty? || ENV["INTERNAL_API_PASSWORD"].to_s.strip.empty?
+  warn "entrypoint: INTERNAL_API_URL / INTERNAL_API_PASSWORD unset - " \
+       "authenticated submission (AUTH + outbound) will not work"
+end
+
+ENV["EXIM_LOCAL_DOMAINS"] = ENV["EXIM_HELO_HOST"] if ENV["EXIM_LOCAL_DOMAINS"].to_s.strip.empty?
+ENV["EXIM_TLS_CERT"]     ||= ""
+ENV["EXIM_TLS_KEY"]      ||= ""
+ENV["EXIM_TLS_HARDENING"]  = "" # set below, after we detect the TLS library
+
+def render(template)
+  rendered = template.gsub(/@@(\w+)@@/) do
+    name = Regexp.last_match(1)
+    abort "entrypoint: template references unknown @@#{name}@@" unless ALLOWED.include?(name)
+    ENV[name].to_s
+  end
+  File.write(CONF, rendered)
+  gid = begin
+    Etc.getgrnam("Debian-exim").gid
+  rescue ArgumentError
+    nil
+  end
+  File.chown(0, gid, CONF) if gid
+  File.chmod(0o640, CONF)
+end
+
+template = File.read(TEMPLATE)
+
+# First render + validate. `exim4 -bV` also reports the TLS library it was
+# built against, which we use to pick the protocol-floor directive.
+render(template)
+report = `/usr/sbin/exim4 -bV 2>&1`
+abort "entrypoint: exim config check failed:\n#{report}" unless $?.success?
+
+ENV["EXIM_TLS_HARDENING"] =
+  if report.include?("OpenSSL")
+    "openssl_options = +no_sslv2 +no_sslv3 +no_tlsv1 +no_tlsv1_1"
+  elsif report.match?(/GnuTLS/i)
+    "tls_require_ciphers = NORMAL:-VERS-ALL:+VERS-TLS1.2:+VERS-TLS1.3"
+  else
+    "" # unknown library - leave Exim's defaults in place
+  end
+
+unless ENV["EXIM_TLS_HARDENING"].empty?
+  render(template)
+  abort "entrypoint: config check failed after TLS hardening" \
+    unless system("/usr/sbin/exim4", "-bV", out: File::NULL, err: File::NULL)
+end
+
+# -bd daemon, -q30m runs the retry queue every 30 min, -v keeps Exim in the
+# foreground and logging to stdout (log_file_path = /dev/stdout).
+exec "/usr/sbin/exim4", "-bd", "-q30m", "-v"

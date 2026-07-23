@@ -1,0 +1,5 @@
+.env
+*.log
+.ruby-lsp/
+.DS_Store
+*.swp

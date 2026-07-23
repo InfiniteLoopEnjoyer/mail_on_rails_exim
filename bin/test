@@ -1,0 +1,5 @@
+#!/bin/bash
+# Run the Ruby test suite (stdlib minitest; no bundle needed).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec ruby -Itest -e 'Dir["test/**/*_test.rb"].each { |f| require File.expand_path(f) }'

@@ -1,0 +1,89 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Queue an authenticated user's outbound message in the app, which
+# DKIM-signs it and delivers to the recipient's MX. Invoked by the
+# rails_outbound pipe transport once per message:
+#
+#   rails-outbound sender=<envelope-from> auth=<authenticated_id> <rcpt>...
+#
+# with the raw RFC822 message on stdin. The envelope sender is forced to
+# the authenticated identity (a submitter can't queue mail as someone
+# else). The app enforces its queue cap and answers 507 when full; that
+# (and any transport error) maps to exit 75 so Exim defers and retries.
+# Exit 0 = queued, 1 = permanent rejection.
+#
+# The pure bits (request_uri, classify) are covered by
+# test/outbound_request_test.rb; #main runs only when executed directly.
+
+require "net/http"
+require "uri"
+
+module RailsOutbound
+  TEMPFAIL = 75
+
+  def self.parse_args(argv)
+    parsed = { sender: "", auth: "", rcpts: [] }
+    argv.each do |arg|
+      case arg
+      when /\Asender=/ then parsed[:sender] = arg.sub(/\Asender=/, "")
+      when /\Aauth=/   then parsed[:auth]   = arg.sub(/\Aauth=/, "")
+      else parsed[:rcpts] << arg
+      end
+    end
+    parsed
+  end
+
+  # Build the outbound_messages URL. The envelope sender is forced to the
+  # authenticated identity when present. Pure - no network.
+  def self.request_uri(base, sender:, auth:, rcpts:)
+    mail_from = auth.to_s.empty? ? sender.to_s : auth.to_s
+    query = URI.encode_www_form([ [ "mail_from", mail_from ] ] + Array(rcpts).map { |r| [ "rcpt[]", r ] })
+    URI("#{base.to_s.sub(%r{/\z}, '')}/outbound_messages?#{query}")
+  end
+
+  # Map an HTTP status to a process exit code. Pure.
+  def self.classify(code)
+    case code.to_i
+    when 200..299 then 0
+    when 507      then TEMPFAIL # queue full - retry later
+    when 400..499 then 1        # permanent rejection
+    else               TEMPFAIL # 5xx / unexpected - retry
+    end
+  end
+
+  def self.post(uri, password, data)
+    request = Net::HTTP::Post.new(uri)
+    request.basic_auth("mail_on_rails", password)
+    request.content_type = "message/rfc822"
+    request.body = data
+    Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https",
+                    open_timeout: 5, read_timeout: 120, write_timeout: 120,
+                    min_version: :TLS1_2) { |http| http.request(request) }
+  end
+
+  # Returns the process exit code.
+  def self.main(argv, stdin)
+    base = ENV["INTERNAL_API_URL"].to_s
+    password = ENV["INTERNAL_API_PASSWORD"].to_s
+    if base.empty? || password.empty?
+      warn "rails-outbound: INTERNAL_API_URL / INTERNAL_API_PASSWORD unset"
+      return TEMPFAIL
+    end
+
+    uri = request_uri(base, **parse_args(argv))
+
+    begin
+      response = post(uri, password, stdin.binmode.read)
+    rescue StandardError => e
+      warn "rails-outbound: #{e.class}: #{e.message}"
+      return TEMPFAIL
+    end
+
+    code = classify(response.code)
+    warn "rails-outbound: #{response.code} -> exit #{code}" unless code.zero?
+    code
+  end
+end
+
+exit RailsOutbound.main(ARGV, $stdin) if $PROGRAM_NAME == __FILE__
