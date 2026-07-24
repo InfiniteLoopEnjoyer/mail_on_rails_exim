@@ -183,8 +183,14 @@ rails_ingress:
   # They are base64 encoded because "environment" is a colon-separated list
   # and an IPv6 $sender_host_address is full of colons; it also stops any
   # value from injecting a second variable. rails-ingress decodes them.
+  #
+  # Setting "environment" REPLACES the inherited environment (keep_environment
+  # above only governs what the Exim process itself keeps), so the two values
+  # the helper needs are re-added here. ${env{}} reads them out of Exim's own
+  # environment, so no secret is written into this file; ${sg{}{:}{::}} doubles
+  # any colon, which the URL certainly has, so the list still parses.
   command        = /usr/local/bin/ruby /usr/local/bin/rails-ingress $pipe_addresses
-  environment    = EXIM_SENDER=${base64:$sender_address} : EXIM_AUTH=${base64:$authenticated_id} : EXIM_IP=${base64:$sender_host_address} : EXIM_HELO=${base64:$sender_helo_name}
+  environment    = INGRESS_URL=${sg{${env{INGRESS_URL}}}{:}{::}} : INGRESS_PASSWORD=${sg{${env{INGRESS_PASSWORD}}}{:}{::}} : EXIM_SENDER=${base64:$sender_address} : EXIM_AUTH=${base64:$authenticated_id} : EXIM_IP=${base64:$sender_host_address} : EXIM_HELO=${base64:$sender_helo_name}
   batch_max      = 100
   use_shell      = false
   message_prefix =
@@ -195,11 +201,10 @@ rails_ingress:
 
 rails_outbound:
   driver         = pipe
-  # Environment-carried, base64-encoded, for the same reason as rails_ingress
-  # above (Exim's taint check rejects a command line built from values a
-  # remote peer supplied).
+  # Environment-carried, base64-encoded, and with the INTERNAL_API_* values
+  # re-added by reference - all for the same reasons as rails_ingress above.
   command        = /usr/local/bin/ruby /usr/local/bin/rails-outbound $pipe_addresses
-  environment    = EXIM_SENDER=${base64:$sender_address} : EXIM_AUTH=${base64:$authenticated_id}
+  environment    = INTERNAL_API_URL=${sg{${env{INTERNAL_API_URL}}}{:}{::}} : INTERNAL_API_PASSWORD=${sg{${env{INTERNAL_API_PASSWORD}}}{:}{::}} : EXIM_SENDER=${base64:$sender_address} : EXIM_AUTH=${base64:$authenticated_id}
   batch_max      = 100
   use_shell      = false
   message_prefix =
