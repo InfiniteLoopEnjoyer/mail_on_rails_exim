@@ -4,10 +4,11 @@
 # Hand an accepted message to the app's Action Mailbox relay ingress.
 # Invoked by the rails_ingress pipe transport once per message:
 #
-#   rails-ingress sender=<envelope-from> auth=<authenticated_id> \
-#                 ip=<client-ip> helo=<base64 HELO> <rcpt>...
+#   rails-ingress <rcpt>...
 #
-# with the raw RFC822 message on stdin.
+# with the raw RFC822 message on stdin and the connection facts in the
+# environment (EXIM_SENDER / EXIM_AUTH / EXIM_IP / EXIM_HELO, each base64
+# encoded - see the transport in config/exim4.conf.template).
 #
 # The app's mailroom TRUSTS X-Original-To / Return-Path / X-MailOnRails-*
 # headers, so any forged copy in the submitted message is stripped here
@@ -18,8 +19,7 @@
 #   - X-MailOnRails-Authenticated (the SMTP-AUTH identity, or "no");
 #   - X-MailOnRails-Client-Ip / X-MailOnRails-Helo - the connecting IP and
 #     HELO name, forwarded so the app can run SPF/DKIM/DMARC (rspamd) even
-#     though it never sees the connection. (helo is base64 on the command
-#     line so an attacker-chosen HELO can't inject extra arguments.)
+#     though it never sees the connection.
 # Exit codes: 0 accepted, 1 permanent (bounce), 75 temporary (Exim retries).
 #
 # The trust-boundary logic (RailsIngress.stamp) is pure and covered by
@@ -58,31 +58,23 @@ module RailsIngress
     stamped + strip_trusted(raw)
   end
 
-  # Every value arrives base64-wrapped from the transport (see the comment on
-  # the rails_ingress command in config/exim4.conf.template): Exim's taint
-  # check refuses remote-supplied data on a pipe command line, and ${base64:}
-  # is its untainting operator - which also stops any of these values from
-  # injecting an extra argument.
-  def self.decode(arg)
-    arg.to_s.unpack1("m").to_s
+  # Decode one base64 EXIM_* value from the transport's environment.
+  def self.decode(value)
+    value.to_s.unpack1("m").to_s
   end
 
-  def self.parse_args(argv)
-    parsed = { sender: "", auth: "", ip: "", helo: "", rcpts: [] }
-    argv.each do |arg|
-      case arg
-      when /\Asender=/ then parsed[:sender] = decode(arg.sub(/\Asender=/, ""))
-      when /\Aauth=/   then parsed[:auth]   = decode(arg.sub(/\Aauth=/, ""))
-      when /\Aip=/     then parsed[:ip]     = decode(arg.sub(/\Aip=/, ""))
-      when /\Ahelo=/   then parsed[:helo]   = decode(arg.sub(/\Ahelo=/, ""))
-      # One blob holding every envelope recipient, space separated - Exim's
-      # $pipe_addresses only splits into separate argv entries when used bare,
-      # and bare is exactly what the taint check rejects.
-      when /\Arcpts=/  then parsed[:rcpts].concat(decode(arg.sub(/\Arcpts=/, "")).split(" "))
-      else parsed[:rcpts] << arg
-      end
-    end
-    parsed
+  # The connection facts come from the environment, base64 encoded, and the
+  # envelope recipients from argv - see the comment on the rails_ingress
+  # transport in config/exim4.conf.template for why they are split that way
+  # (Exim's taint check bars remote-supplied data from a pipe command line,
+  # while bare $pipe_addresses is exempt and is the only source of the
+  # batched recipient list).
+  def self.connection_facts(argv, env)
+    { sender: decode(env["EXIM_SENDER"]),
+      auth:   decode(env["EXIM_AUTH"]),
+      ip:     decode(env["EXIM_IP"]),
+      helo:   decode(env["EXIM_HELO"]),
+      rcpts:  argv.dup }
   end
 
   def self.post(url, password, body)
@@ -97,7 +89,7 @@ module RailsIngress
   end
 
   # Returns the process exit code.
-  def self.main(argv, stdin)
+  def self.main(argv, stdin, env = ENV)
     url = ENV["INGRESS_URL"].to_s
     password = ENV["INGRESS_PASSWORD"].to_s
     if url.empty? || password.empty?
@@ -105,7 +97,7 @@ module RailsIngress
       return TEMPFAIL
     end
 
-    message = stamp(stdin.binmode.read, **parse_args(argv))
+    message = stamp(stdin.binmode.read, **connection_facts(argv, env))
 
     begin
       response = post(url, password, message)
@@ -122,4 +114,4 @@ module RailsIngress
   end
 end
 
-exit RailsIngress.main(ARGV, $stdin) if $PROGRAM_NAME == __FILE__
+exit RailsIngress.main(ARGV, $stdin, ENV) if $PROGRAM_NAME == __FILE__

@@ -22,25 +22,17 @@ require "uri"
 module RailsOutbound
   TEMPFAIL = 75
 
-  # Values arrive base64-wrapped from the transport - Exim's taint check
-  # rejects remote-supplied data on a pipe command line, and ${base64:} is its
-  # untainting operator (see config/exim4.conf.template).
-  def self.decode(arg)
-    arg.to_s.unpack1("m").to_s
+  # Decode one base64 EXIM_* value from the transport's environment.
+  def self.decode(value)
+    value.to_s.unpack1("m").to_s
   end
 
-  def self.parse_args(argv)
-    parsed = { sender: "", auth: "", rcpts: [] }
-    argv.each do |arg|
-      case arg
-      when /\Asender=/ then parsed[:sender] = decode(arg.sub(/\Asender=/, ""))
-      when /\Aauth=/   then parsed[:auth]   = decode(arg.sub(/\Aauth=/, ""))
-      # One blob holding every recipient, space separated (see rails-ingress).
-      when /\Arcpts=/  then parsed[:rcpts].concat(decode(arg.sub(/\Arcpts=/, "")).split(" "))
-      else parsed[:rcpts] << arg
-      end
-    end
-    parsed
+  # Sender and AUTH identity come from the environment, recipients from argv -
+  # see the rails_outbound transport in config/exim4.conf.template (Exim's
+  # taint check bars remote-supplied data from a pipe command line, while bare
+  # $pipe_addresses is exempt).
+  def self.connection_facts(argv, env)
+    { sender: decode(env["EXIM_SENDER"]), auth: decode(env["EXIM_AUTH"]), rcpts: argv.dup }
   end
 
   # Build the outbound_messages URL. The envelope sender is forced to the
@@ -72,7 +64,7 @@ module RailsOutbound
   end
 
   # Returns the process exit code.
-  def self.main(argv, stdin)
+  def self.main(argv, stdin, env = ENV)
     base = ENV["INTERNAL_API_URL"].to_s
     password = ENV["INTERNAL_API_PASSWORD"].to_s
     if base.empty? || password.empty?
@@ -80,7 +72,7 @@ module RailsOutbound
       return TEMPFAIL
     end
 
-    uri = request_uri(base, **parse_args(argv))
+    uri = request_uri(base, **connection_facts(argv, env))
 
     begin
       response = post(uri, password, stdin.binmode.read)
@@ -95,4 +87,4 @@ module RailsOutbound
   end
 end
 
-exit RailsOutbound.main(ARGV, $stdin) if $PROGRAM_NAME == __FILE__
+exit RailsOutbound.main(ARGV, $stdin, ENV) if $PROGRAM_NAME == __FILE__

@@ -169,14 +169,22 @@ begin transports
 # X-Original-To per recipient. Raw message on stdin, unaltered by Exim.
 rails_ingress:
   driver         = pipe
-  # Every value is base64-wrapped. Exim refuses to place tainted data (the
-  # envelope sender, recipients, client IP, HELO, AUTH id - anything a remote
-  # peer chose) on a pipe transport's command line and fails the delivery with
-  # "Tainted arg N for rails_ingress transport command"; ${base64:...} is
-  # Exim's untainting operator (the same idiom acl_rcpt uses for rcpt-check),
-  # and it doubles as injection-proofing, since an attacker-chosen value can
-  # then never introduce a new argument. rails-ingress decodes each one.
-  command        = /usr/local/bin/ruby /usr/local/bin/rails-ingress sender=${base64:$sender_address} auth=${base64:$authenticated_id} ip=${base64:$sender_host_address} helo=${base64:$sender_helo_name} rcpts=${base64:$pipe_addresses}
+  # Exim refuses to build a pipe command line out of tainted data - anything a
+  # remote peer chose (envelope sender, client IP, HELO, AUTH id) - and fails
+  # the delivery with "Tainted arg N for rails_ingress transport command".
+  # ${base64:} does NOT untaint (taint propagates through it), and the only
+  # untainting sources are lookups, which need a trusted table we cannot have
+  # for arbitrary senders. So the connection facts travel in the environment
+  # instead, which carries no such restriction, and only the recipients stay
+  # on the command line - bare $pipe_addresses, which Exim expands into one
+  # argument per recipient and exempts from the taint check (it is also the
+  # only place that variable exists at all).
+  #
+  # They are base64 encoded because "environment" is a colon-separated list
+  # and an IPv6 $sender_host_address is full of colons; it also stops any
+  # value from injecting a second variable. rails-ingress decodes them.
+  command        = /usr/local/bin/ruby /usr/local/bin/rails-ingress $pipe_addresses
+  environment    = EXIM_SENDER=${base64:$sender_address} : EXIM_AUTH=${base64:$authenticated_id} : EXIM_IP=${base64:$sender_host_address} : EXIM_HELO=${base64:$sender_helo_name}
   batch_max      = 100
   use_shell      = false
   message_prefix =
@@ -187,9 +195,11 @@ rails_ingress:
 
 rails_outbound:
   driver         = pipe
-  # base64-wrapped for the same reason as rails_ingress above (Exim's taint
-  # check rejects a command line built from remote-supplied values).
-  command        = /usr/local/bin/ruby /usr/local/bin/rails-outbound sender=${base64:$sender_address} auth=${base64:$authenticated_id} rcpts=${base64:$pipe_addresses}
+  # Environment-carried, base64-encoded, for the same reason as rails_ingress
+  # above (Exim's taint check rejects a command line built from values a
+  # remote peer supplied).
+  command        = /usr/local/bin/ruby /usr/local/bin/rails-outbound $pipe_addresses
+  environment    = EXIM_SENDER=${base64:$sender_address} : EXIM_AUTH=${base64:$authenticated_id}
   batch_max      = 100
   use_shell      = false
   message_prefix =
