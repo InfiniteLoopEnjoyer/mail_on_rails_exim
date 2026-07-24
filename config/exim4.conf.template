@@ -169,7 +169,14 @@ begin transports
 # X-Original-To per recipient. Raw message on stdin, unaltered by Exim.
 rails_ingress:
   driver         = pipe
-  command        = /usr/local/bin/ruby /usr/local/bin/rails-ingress sender=$sender_address auth=$authenticated_id ip=$sender_host_address helo=${base64:$sender_helo_name} $pipe_addresses
+  # Every value is base64-wrapped. Exim refuses to place tainted data (the
+  # envelope sender, recipients, client IP, HELO, AUTH id - anything a remote
+  # peer chose) on a pipe transport's command line and fails the delivery with
+  # "Tainted arg N for rails_ingress transport command"; ${base64:...} is
+  # Exim's untainting operator (the same idiom acl_rcpt uses for rcpt-check),
+  # and it doubles as injection-proofing, since an attacker-chosen value can
+  # then never introduce a new argument. rails-ingress decodes each one.
+  command        = /usr/local/bin/ruby /usr/local/bin/rails-ingress sender=${base64:$sender_address} auth=${base64:$authenticated_id} ip=${base64:$sender_host_address} helo=${base64:$sender_helo_name} rcpts=${base64:$pipe_addresses}
   batch_max      = 100
   use_shell      = false
   message_prefix =
@@ -180,7 +187,9 @@ rails_ingress:
 
 rails_outbound:
   driver         = pipe
-  command        = /usr/local/bin/ruby /usr/local/bin/rails-outbound sender=$sender_address auth=$authenticated_id $pipe_addresses
+  # base64-wrapped for the same reason as rails_ingress above (Exim's taint
+  # check rejects a command line built from remote-supplied values).
+  command        = /usr/local/bin/ruby /usr/local/bin/rails-outbound sender=${base64:$sender_address} auth=${base64:$authenticated_id} rcpts=${base64:$pipe_addresses}
   batch_max      = 100
   use_shell      = false
   message_prefix =

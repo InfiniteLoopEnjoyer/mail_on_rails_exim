@@ -22,12 +22,21 @@ require "uri"
 module RailsOutbound
   TEMPFAIL = 75
 
+  # Values arrive base64-wrapped from the transport - Exim's taint check
+  # rejects remote-supplied data on a pipe command line, and ${base64:} is its
+  # untainting operator (see config/exim4.conf.template).
+  def self.decode(arg)
+    arg.to_s.unpack1("m").to_s
+  end
+
   def self.parse_args(argv)
     parsed = { sender: "", auth: "", rcpts: [] }
     argv.each do |arg|
       case arg
-      when /\Asender=/ then parsed[:sender] = arg.sub(/\Asender=/, "")
-      when /\Aauth=/   then parsed[:auth]   = arg.sub(/\Aauth=/, "")
+      when /\Asender=/ then parsed[:sender] = decode(arg.sub(/\Asender=/, ""))
+      when /\Aauth=/   then parsed[:auth]   = decode(arg.sub(/\Aauth=/, ""))
+      # One blob holding every recipient, space separated (see rails-ingress).
+      when /\Arcpts=/  then parsed[:rcpts].concat(decode(arg.sub(/\Arcpts=/, "")).split(" "))
       else parsed[:rcpts] << arg
       end
     end

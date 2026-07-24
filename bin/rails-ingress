@@ -58,14 +58,27 @@ module RailsIngress
     stamped + strip_trusted(raw)
   end
 
+  # Every value arrives base64-wrapped from the transport (see the comment on
+  # the rails_ingress command in config/exim4.conf.template): Exim's taint
+  # check refuses remote-supplied data on a pipe command line, and ${base64:}
+  # is its untainting operator - which also stops any of these values from
+  # injecting an extra argument.
+  def self.decode(arg)
+    arg.to_s.unpack1("m").to_s
+  end
+
   def self.parse_args(argv)
     parsed = { sender: "", auth: "", ip: "", helo: "", rcpts: [] }
     argv.each do |arg|
       case arg
-      when /\Asender=/ then parsed[:sender] = arg.sub(/\Asender=/, "")
-      when /\Aauth=/   then parsed[:auth]   = arg.sub(/\Aauth=/, "")
-      when /\Aip=/     then parsed[:ip]     = arg.sub(/\Aip=/, "")
-      when /\Ahelo=/   then parsed[:helo]   = arg.sub(/\Ahelo=/, "").unpack1("m").to_s
+      when /\Asender=/ then parsed[:sender] = decode(arg.sub(/\Asender=/, ""))
+      when /\Aauth=/   then parsed[:auth]   = decode(arg.sub(/\Aauth=/, ""))
+      when /\Aip=/     then parsed[:ip]     = decode(arg.sub(/\Aip=/, ""))
+      when /\Ahelo=/   then parsed[:helo]   = decode(arg.sub(/\Ahelo=/, ""))
+      # One blob holding every envelope recipient, space separated - Exim's
+      # $pipe_addresses only splits into separate argv entries when used bare,
+      # and bare is exactly what the taint check rejects.
+      when /\Arcpts=/  then parsed[:rcpts].concat(decode(arg.sub(/\Arcpts=/, "")).split(" "))
       else parsed[:rcpts] << arg
       end
     end
