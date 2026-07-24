@@ -32,6 +32,21 @@ servers:
 
 primary_role: mail
 
+# The image's HEALTHCHECK (Dockerfile) runs on a 30s interval, so the first
+# probe lands right at kamal's default 30s readiness wait and the deploy fails
+# with "container not ready after 30 seconds (unhealthy)" even though Exim is
+# up. Give it room for a probe or two.
+deploy_timeout: 90
+
+# Exim streams its logs to the container's stdout (see bin/entrypoint), and
+# Docker's json-file driver stores that stream unbounded by default. Cap it
+# so logs can't fill the host disk - ~50 MB retained, older rotated out.
+logging:
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: 5
+
 # Any registry both the build machine and the servers can reach.
 registry:
   server: registry.example.com
@@ -50,7 +65,9 @@ env:
     # Domains we host, ':' separated (Exim list syntax). Used to split
     # authenticated submission into local (-> ingress) vs remote
     # (-> outbound). Defaults to EXIM_HELO_HOST if unset.
-    EXIM_LOCAL_DOMAINS: example.com : example.net
+    # (quoted - a bare "a : b" is invalid YAML, the colon-space reads as a
+    # nested mapping and every kamal command aborts on a Psych::SyntaxError)
+    EXIM_LOCAL_DOMAINS: "example.com : example.net"
 
     # Inbound + local submission are POSTed to the app's relay ingress;
     # AUTH checks and outbound queueing go to the internal API. If the app

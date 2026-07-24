@@ -24,7 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY bin/ /usr/local/bin/
 RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/healthcheck \
              /usr/local/bin/rails-ingress /usr/local/bin/rails-outbound \
-             /usr/local/bin/auth-check
+             /usr/local/bin/auth-check /usr/local/bin/rcpt-check
 
 COPY config/exim4.conf.template /etc/exim4/exim4.conf.template
 

@@ -10,26 +10,35 @@
 # with the matching @@EXIM_TLS_HARDENING@@ (empty if undetected).
 
 require "etc"
+require "fileutils"
 
 CONF = "/etc/exim4/exim4.conf"
 TEMPLATE = "/etc/exim4/exim4.conf.template"
 ALLOWED = %w[EXIM_HELO_HOST EXIM_LOCAL_DOMAINS EXIM_TLS_CERT EXIM_TLS_KEY EXIM_TLS_HARDENING].freeze
+# Exim logs to files (it needs %s and won't write /dev/stdout); these three
+# are turned into FIFOs streamed to our stdout below - matches %slog in the
+# template's log_file_path.
+LOG_DIR = "/var/log/exim4"
+LOG_KINDS = %w[main reject panic].freeze
+EXIM_UID = (Etc.getpwnam("Debian-exim").uid rescue nil)
+EXIM_GID = (Etc.getgrnam("Debian-exim").gid rescue nil)
 
-%w[EXIM_HELO_HOST INGRESS_URL INGRESS_PASSWORD].each do |key|
+# All required. INGRESS_* is the inbound handoff; INTERNAL_API_* backs AUTH,
+# outbound queueing, and - now - RCPT-time recipient verification, which
+# every inbound message depends on, so the edge must not start without it.
+# Fail fast here rather than let a misconfig surface as deferred live mail.
+%w[EXIM_HELO_HOST INGRESS_URL INGRESS_PASSWORD INTERNAL_API_URL INTERNAL_API_PASSWORD].each do |key|
   abort "entrypoint: #{key} is not set" if ENV[key].to_s.strip.empty?
-end
-
-# Needed only for authenticated submission (AUTH + outbound). Inbound still
-# works without them; AUTH just gets denied if a client tries it.
-if ENV["INTERNAL_API_URL"].to_s.strip.empty? || ENV["INTERNAL_API_PASSWORD"].to_s.strip.empty?
-  warn "entrypoint: INTERNAL_API_URL / INTERNAL_API_PASSWORD unset - " \
-       "authenticated submission (AUTH + outbound) will not work"
 end
 
 ENV["EXIM_LOCAL_DOMAINS"] = ENV["EXIM_HELO_HOST"] if ENV["EXIM_LOCAL_DOMAINS"].to_s.strip.empty?
 ENV["EXIM_TLS_CERT"]     ||= ""
 ENV["EXIM_TLS_KEY"]      ||= ""
 ENV["EXIM_TLS_HARDENING"]  = "" # set below, after we detect the TLS library
+
+# The config checks below open the logs, so the directory must exist first.
+FileUtils.mkdir_p(LOG_DIR)
+File.chown(EXIM_UID, EXIM_GID, LOG_DIR) if EXIM_UID
 
 def render(template)
   rendered = template.gsub(/@@(\w+)@@/) do
@@ -70,6 +79,24 @@ unless ENV["EXIM_TLS_HARDENING"].empty?
     unless system("/usr/sbin/exim4", "-bV", out: File::NULL, err: File::NULL)
 end
 
-# -bd daemon, -q30m runs the retry queue every 30 min, -v keeps Exim in the
-# foreground and logging to stdout (log_file_path = /dev/stdout).
-exec "/usr/sbin/exim4", "-bd", "-q30m", "-v"
+# Turn the three log files into FIFOs so nothing accumulates on disk, and
+# stream the main log to our own stdout for `kamal logs`. Exim copies reject
+# and panic entries into the main log too, so we only DRAIN those two pipes
+# (to /dev/null) - forwarding them as well would double every such line -
+# while still keeping Exim from blocking on a full pipe. The `while` loop
+# re-opens a pipe if Exim closes it (log reopen); these spawn()ed forwarders
+# keep running across the exec below.
+LOG_KINDS.each do |kind|
+  path = File.join(LOG_DIR, "#{kind}log")
+  File.unlink(path) if File.exist?(path)
+  File.mkfifo(path, 0o660)
+  File.chown(EXIM_UID, EXIM_GID, path) if EXIM_UID
+  sink = kind == "main" ? "" : "> /dev/null"
+  spawn("/bin/sh", "-c", "while :; do cat #{path} #{sink}; done")
+end
+
+# -bd daemon, -q30m runs the retry queue every 30 min. -v keeps Exim in the
+# foreground (PID 1) - it also copies the main log to stderr, so we discard
+# stderr and let the main-log FIFO be the single log source. Panics still
+# surface there too (Exim copies panic entries into the main log).
+exec("/usr/sbin/exim4", "-bd", "-q30m", "-v", err: "/dev/null")

@@ -9,7 +9,10 @@
 # Flow:
 #   - Inbound (:25) and authenticated submission to a local domain -> the
 #     app's Action Mailbox relay ingress (bin/rails-ingress). Rails matches
-#     recipients to accounts, drops the rest, and scans for viruses/spam.
+#     recipients to accounts and scans for viruses/spam. Unauthenticated
+#     inbound recipients are first verified at RCPT time against the app
+#     (bin/rcpt-check): a domain we host with no such account gets 550, so
+#     unknown users bounce at the sender instead of being silently dropped.
 #   - Authenticated submission to a REMOTE domain -> queued in the app via
 #     the internal API (bin/rails-outbound); the app DKIM-signs and sends.
 #     This is the only path that leaves for another server and it requires
@@ -79,8 +82,11 @@ smtp_banner = $smtp_active_hostname ESMTP
 keep_environment = INGRESS_URL : INGRESS_PASSWORD : INTERNAL_API_URL : INTERNAL_API_PASSWORD
 add_environment  = <; PATH=/usr/local/bin:/usr/bin:/bin
 
-# Log to the container's stdout so `kamal logs` / `docker logs` see it.
-log_file_path = /dev/stdout
+# Exim requires %s in log_file_path and refuses to log to /dev/stdout, so it
+# logs to files here. bin/entrypoint makes main/reject/paniclog FIFOs and
+# streams each to the container's stdout, so `kamal logs` sees everything
+# while nothing accumulates on disk (the pipes store nothing).
+log_file_path = /var/log/exim4/%slog
 
 acl_smtp_rcpt = acl_rcpt
 acl_smtp_auth = acl_auth
@@ -97,10 +103,33 @@ acl_rcpt:
          !authenticated  = *
          ratelimit       = 100 / 1h / per_rcpt / strict / $sender_host_address
 
-  # Accept every recipient. Rails decides what maps to a local account and
-  # drops the rest. Safe: unauthenticated mail is only ever handed to the
-  # inbound ingress by the routers below - never queued outbound.
-  accept
+  # Authenticated submitters are exempt from recipient verification: they
+  # send outbound (remote) and to local users; the routers sort that out.
+  accept authenticated = *
+
+  # Unauthenticated (inbound MX) from here down. Verify each recipient in a
+  # domain we host against the app so unknown users get a proper 550 (the
+  # sender's server bounces) instead of being accepted and silently dropped.
+  # rcpt-check exits 0 (accept: real account), 1 (deny: no such account), or
+  # 2 (defer: app unreachable/unconfigured). Run it once per recipient and
+  # capture the exit code (the {}{} branches expand empty; $runrc holds the
+  # code right after the run).
+  warn   domains = +local_domains
+         set acl_m_rcpt_rc = ${run{/usr/local/bin/ruby /usr/local/bin/rcpt-check ${base64:$local_part@$domain}}{}{}}${runrc}
+
+  accept domains   = +local_domains
+         condition = ${if eq{$acl_m_rcpt_rc}{0}}
+
+  defer  domains   = +local_domains
+         condition = ${if eq{$acl_m_rcpt_rc}{2}}
+         message   = recipient verification temporarily unavailable, try again later
+
+  deny   domains = +local_domains
+         message = no such user here
+
+  # Unauthenticated mail to a domain we don't host: relaying is not allowed
+  # (this also never reaches the outbound router, which requires auth).
+  deny   message = relaying not permitted
 
 # Throttle AUTH attempts per IP - each one spawns a Ruby check against the
 # app, so this caps both brute force and its amplification.

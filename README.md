@@ -14,19 +14,25 @@ installed on top. The helper scripts use only the Ruby standard library
 ## How mail flows
 
 ```
-   internet ──► Exim :25 (MX) ─────────► POST relay ingress      (bin/rails-ingress)
-                                          (Rails drops unknown accounts)
+   internet ──► Exim :25 (MX) ─┬─ RCPT ────► POST internal/rcpt_check     (bin/rcpt-check)
+                               │              (unknown local user → 550)
+                               └─ DATA ────► POST relay ingress           (bin/rails-ingress)
 
    iPhone / client ─► Exim :587/:465 ─┬─ AUTH ────► POST internal/authenticate  (bin/auth-check)
                       (submission)     ├─ local ───► POST relay ingress          (bin/rails-ingress)
                                        └─ remote ──► POST internal/outbound_messages (bin/rails-outbound)
 ```
 
-- **Inbound (port 25).** Every recipient is accepted — no per-account
-  check here. The raw message is POSTed to the app's Action Mailbox
-  **relay ingress** ([`bin/rails-ingress`](bin/rails-ingress)). Rails
-  matches recipients to local accounts, drops the rest, and does virus +
-  spam scanning.
+- **Inbound (port 25).** Each recipient in a domain we host is verified at
+  RCPT time against the app ([`bin/rcpt-check`](bin/rcpt-check)): an unknown
+  local user gets `550` (so the sender's server bounces it) instead of being
+  accepted and silently dropped; an unreachable app defers with `451`. The
+  accepted message is then POSTed to the app's Action Mailbox **relay
+  ingress** ([`bin/rails-ingress`](bin/rails-ingress)), where Rails matches
+  recipients to local accounts and does virus + spam scanning. The internal
+  API is **required** — the edge refuses to start without it (see
+  [bin/entrypoint](bin/entrypoint)) — so there is no path that accepts a
+  recipient without verifying it.
 - **Authenticated submission (587 STARTTLS / 465 implicit TLS).** This is
   the outgoing server an IMAP mail client (e.g. iPhone Mail) sends
   through. AUTH LOGIN/PLAIN credentials are checked against the app's
@@ -98,7 +104,7 @@ All configuration is environment variables (see
 | `EXIM_HELO_HOST` | Public mail name (banner/EHLO); match the PTR. |
 | `EXIM_LOCAL_DOMAINS` | Domains you host (Exim `:`-separated list). Splits authenticated submission into local (→ ingress) vs remote (→ outbound). Defaults to `EXIM_HELO_HOST`. |
 | `INGRESS_URL` / `INGRESS_PASSWORD` | Relay ingress URL + `action_mailbox.ingress_password`. |
-| `INTERNAL_API_URL` / `INTERNAL_API_PASSWORD` | Internal API URL + `mail_on_rails.internal_api_password` (AUTH + outbound queueing). Optional if you don't need submission. |
+| `INTERNAL_API_URL` / `INTERNAL_API_PASSWORD` | Internal API URL + `mail_on_rails.internal_api_password` (AUTH, outbound queueing, and inbound RCPT verification). **Required** — the entrypoint aborts if unset, since every inbound message is verified against it. |
 | `EXIM_TLS_CERT` / `EXIM_TLS_KEY` | PEM paths. Unset ⇒ no TLS advertised (dev only; AUTH is then not offered). |
 
 The config file holds no secrets — the Ruby helpers read the passwords
@@ -180,6 +186,10 @@ and exercises its pure methods directly.
 - `test/auth_check_test.rb` — AUTH is granted only on a 2xx with a
   non-null `account_id`; base64 arg-wrapping round-trips passwords with
   spaces; malformed/`null`/non-2xx responses deny.
+- `test/rcpt_check_test.rb` — a recipient is local only if the endpoint
+  echoes it back (matched case/space-insensitively); the URL never doubles
+  its slash; and with no internal API configured the check accepts (exit 0)
+  rather than deferring everything.
 
 ## Deploy with Kamal
 
@@ -192,13 +202,26 @@ Because the listeners publish host ports, Kamal's boot-new-before-stop
 would clash on them, so [.kamal/hooks/pre-app-boot](.kamal/hooks/pre-app-boot)
 stops the previous container first (a few seconds of downtime per deploy).
 
+### Logging
+
+Exim can't log to `/dev/stdout` (it requires `%s` in `log_file_path` and
+won't open the device), so [bin/entrypoint](bin/entrypoint) makes the
+main/reject/paniclog files FIFOs and streams the **main log** to the
+container's stdout — `kamal logs` sees everything, and **nothing accumulates
+on disk** (the pipes store nothing; reject/panic entries are copied into the
+main log anyway, so their pipes are only drained). The stdout side is bounded
+by the `logging:` block in [config/deploy.yml](config/deploy.yml)
+(`max-size`/`max-file`), so Docker's own JSON log can't fill the host either.
+
 ## What the app side must provide
 
 - `config.action_mailbox.ingress = :relay`.
 - `action_mailbox.ingress_password` credential = `INGRESS_PASSWORD`.
 - `mail_on_rails.internal_api_password` credential (or
   `SMTP_INTERNAL_API_PASSWORD` env) = `INTERNAL_API_PASSWORD`, backing the
-  `authenticate` and `outbound_messages` endpoints.
+  `authenticate`, `outbound_messages`, and `rcpt_check` endpoints. The last
+  echoes back which of the submitted addresses are local accounts, matched
+  the same way the mailroom routes them (stripped + lowercased).
 - Account matching + virus scanning + rspamd filtering in the mailroom,
   and the actual outbound send. ClamAV / rspamd run as the **app's** Kamal
   accessories, not this service's.
