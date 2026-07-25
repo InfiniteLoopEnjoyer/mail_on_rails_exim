@@ -210,16 +210,20 @@ and exercises its pure methods directly.
   spaces; malformed/`null`/non-2xx responses deny.
 - `test/rcpt_check_test.rb` — a recipient is local only if the endpoint
   echoes it back (matched case/space-insensitively); the URL never doubles
-  its slash; and with no internal API configured the check accepts (exit 0)
-  rather than deferring everything.
+  its slash; and with no internal API configured the check defers (exit 2)
+  rather than silently accepting a recipient it can't verify.
 
 ## Deploy with Kamal
 
 1. `cp .env.example .env` and fill in the two passwords.
 2. Edit [config/deploy.yml](config/deploy.yml): `servers`, `registry`,
    `EXIM_HELO_HOST`, `EXIM_LOCAL_DOMAINS` (first-boot seed), the app URLs,
-   and the TLS paths.
-3. `bin/kamal setup` (first time) or `bin/kamal deploy`.
+   and the TLS paths (`EXIM_CLAMAV_ADDR` already defaults to the app's
+   clamav accessory). Real infrastructure lives in a gitignored
+   `config/deploy.prod.yml` overlay, same as the sibling repos.
+3. `kamal setup` (first time) or `kamal deploy` (`-d prod` with the
+   overlay). The kamal CLI comes from the Ruby toolchain — this repo has
+   no bundle, so there is no `bin/kamal` wrapper.
 
 Because the listeners publish host ports, Kamal's boot-new-before-stop
 would clash on them, so [.kamal/hooks/pre-app-boot](.kamal/hooks/pre-app-boot)
