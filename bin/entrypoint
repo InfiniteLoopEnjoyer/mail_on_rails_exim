@@ -50,7 +50,9 @@ if clamav_addr.empty?
 else
   # The regex doubles as config-injection protection (no newlines, list
   # separators, or placeholder markers can reach the rendered config).
-  m = clamav_addr.match(/\A([A-Za-z0-9][A-Za-z0-9.-]*):(\d{1,5})\z/) ||
+  # Underscores are allowed: docker container names have them (the prod
+  # value is mail_on_rails-clamav) even though strict DNS hostnames don't.
+  m = clamav_addr.match(/\A([A-Za-z0-9_][A-Za-z0-9._-]*):(\d{1,5})\z/) ||
       abort("entrypoint: EXIM_CLAMAV_ADDR must be host:port, got #{clamav_addr.inspect}")
   ENV["EXIM_AV_SCANNER"]   = "av_scanner = clamd:#{m[1]} #{m[2]}"
   ENV["EXIM_MALWARE_DENY"] = [
