@@ -28,6 +28,12 @@ RUN chmod +x /usr/local/bin/entrypoint /usr/local/bin/healthcheck \
 
 COPY config/exim4.conf.template /etc/exim4/exim4.conf.template
 
+# Mount point for the shared mailconf volume (see config/deploy.yml). Owned
+# by the Rails app's uid so that if THIS container is the first to mount the
+# fresh named volume, Docker's first-mount copy leaves it writable by the
+# app; bin/entrypoint also repairs the perms on every boot.
+RUN mkdir -p /var/lib/exim4/dynamic && chown 1000:1000 /var/lib/exim4/dynamic
+
 EXPOSE 25 587 465
 
 # Liveness: the MX listener must answer its banner.

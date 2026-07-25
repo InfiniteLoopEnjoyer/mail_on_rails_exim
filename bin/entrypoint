@@ -14,7 +14,7 @@ require "fileutils"
 
 CONF = "/etc/exim4/exim4.conf"
 TEMPLATE = "/etc/exim4/exim4.conf.template"
-ALLOWED = %w[EXIM_HELO_HOST EXIM_LOCAL_DOMAINS EXIM_TLS_CERT EXIM_TLS_KEY EXIM_TLS_HARDENING].freeze
+ALLOWED = %w[EXIM_HELO_HOST EXIM_TLS_CERT EXIM_TLS_KEY EXIM_TLS_HARDENING].freeze
 # Exim logs to files (it needs %s and won't write /dev/stdout); these three
 # are turned into FIFOs streamed to our stdout below - matches %slog in the
 # template's log_file_path.
@@ -39,6 +39,24 @@ ENV["EXIM_TLS_HARDENING"]  = "" # set below, after we detect the TLS library
 # The config checks below open the logs, so the directory must exist first.
 FileUtils.mkdir_p(LOG_DIR)
 File.chown(EXIM_UID, EXIM_GID, LOG_DIR) if EXIM_UID
+
+# Shared mailconf volume: the Rails app (uid 1000) owns local_domains and
+# rewrites it on domain add/remove (Exim's lsearch re-reads it per
+# connection). We only seed it from EXIM_LOCAL_DOMAINS when ABSENT - a
+# redeploy must never clobber the Rails-managed list - and repair the dir
+# perms so both sides can write regardless of which container mounted the
+# fresh volume first.
+DOMAINS_DIR  = "/var/lib/exim4/dynamic"
+DOMAINS_FILE = File.join(DOMAINS_DIR, "local_domains")
+FileUtils.mkdir_p(DOMAINS_DIR)
+File.chmod(0o1777, DOMAINS_DIR)
+unless File.exist?(DOMAINS_FILE)
+  domains = ENV["EXIM_LOCAL_DOMAINS"].to_s.split(":").map(&:strip).reject(&:empty?)
+  tmp = "#{DOMAINS_FILE}.seed.#{Process.pid}"
+  File.write(tmp, domains.join("\n") + "\n")
+  File.chmod(0o644, tmp)
+  File.rename(tmp, DOMAINS_FILE)
+end
 
 def render(template)
   rendered = template.gsub(/@@(\w+)@@/) do

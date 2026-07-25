@@ -62,9 +62,11 @@ env:
     # This host's public mail name (banner/EHLO); should match its PTR.
     EXIM_HELO_HOST: mail.example.com
 
-    # Domains we host, ':' separated (Exim list syntax). Used to split
-    # authenticated submission into local (-> ingress) vs remote
-    # (-> outbound). Defaults to EXIM_HELO_HOST if unset.
+    # FIRST-BOOT SEED for the hosted-domains list, ':' separated (Exim list
+    # syntax). bin/entrypoint writes it to the mailconf volume's
+    # local_domains file only when that file is absent; after that the
+    # Rails app manages the list at runtime (its Domains admin UI rewrites
+    # the file and Exim re-reads it per connection - no redeploy needed).
     # (quoted - a bare "a : b" is invalid YAML, the colon-space reads as a
     # nested mapping and every kamal command aborts on a Psych::SyntaxError)
     EXIM_LOCAL_DOMAINS: "example.com : example.net"
@@ -93,6 +95,10 @@ volumes:
   # Mounted at the letsencrypt root (not live/) because live/*.pem are
   # symlinks into ../../archive/.
   - "/etc/letsencrypt:/etc/letsencrypt:ro"
+  # Shared with the Rails app (which mounts it at /rails/shared): holds the
+  # local_domains file the app rewrites on domain add/remove. Exim's
+  # lsearch re-reads it per connection, so changes apply with no restart.
+  - "mail_on_rails_mailconf:/var/lib/exim4/dynamic"
 
 builder:
   arch: amd64

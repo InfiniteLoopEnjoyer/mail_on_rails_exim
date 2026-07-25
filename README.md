@@ -102,7 +102,7 @@ All configuration is environment variables (see
 | Variable | Purpose |
 | --- | --- |
 | `EXIM_HELO_HOST` | Public mail name (banner/EHLO); match the PTR. |
-| `EXIM_LOCAL_DOMAINS` | Domains you host (Exim `:`-separated list). Splits authenticated submission into local (→ ingress) vs remote (→ outbound). Defaults to `EXIM_HELO_HOST`. |
+| `EXIM_LOCAL_DOMAINS` | **First-boot seed** for the hosted-domains list (Exim `:`-separated list; defaults to `EXIM_HELO_HOST`). The live list is the `local_domains` file on the shared mailconf volume — the Rails app rewrites it on domain add/remove and Exim re-reads it per connection, no restart needed. The entrypoint writes this seed only when that file is absent. |
 | `INGRESS_URL` / `INGRESS_PASSWORD` | Relay ingress URL + `action_mailbox.ingress_password`. |
 | `INTERNAL_API_URL` / `INTERNAL_API_PASSWORD` | Internal API URL + `mail_on_rails.internal_api_password` (AUTH, outbound queueing, and inbound RCPT verification). **Required** — the entrypoint aborts if unset, since every inbound message is verified against it. |
 | `EXIM_TLS_CERT` / `EXIM_TLS_KEY` | PEM paths. Unset ⇒ no TLS advertised (dev only; AUTH is then not offered). |
@@ -133,7 +133,7 @@ docker run --rm -e EXIM_HELO_HOST=mail.example.com \
   -e INGRESS_URL=x -e INGRESS_PASSWORD=x \
   -e INTERNAL_API_URL=x -e INTERNAL_API_PASSWORD=x \
   --entrypoint bash mail_on_rails_exim -c \
-  'ruby -e "%w[EXIM_HELO_HOST].each{}; t=File.read(%q{/etc/exim4/exim4.conf.template}); ENV[%q{EXIM_LOCAL_DOMAINS}]=ENV[%q{EXIM_HELO_HOST}]; %w[EXIM_TLS_CERT EXIM_TLS_KEY].each{|k| ENV[k]||=%q{}}; File.write(%q{/etc/exim4/exim4.conf}, t.gsub(/@@(\w+)@@/){ENV[$1].to_s})" && exim4 -bV'
+  'ruby -e "t=File.read(%q{/etc/exim4/exim4.conf.template}); %w[EXIM_TLS_CERT EXIM_TLS_KEY].each{|k| ENV[k]||=%q{}}; File.write(%q{/etc/exim4/exim4.conf}, t.gsub(/@@(\w+)@@/){ENV[$1].to_s})" && exim4 -bV'
 ```
 
 ## Hardening
@@ -195,7 +195,8 @@ and exercises its pure methods directly.
 
 1. `cp .env.example .env` and fill in the two passwords.
 2. Edit [config/deploy.yml](config/deploy.yml): `servers`, `registry`,
-   `EXIM_HELO_HOST`, `EXIM_LOCAL_DOMAINS`, the app URLs, and the TLS paths.
+   `EXIM_HELO_HOST`, `EXIM_LOCAL_DOMAINS` (first-boot seed), the app URLs,
+   and the TLS paths.
 3. `bin/kamal setup` (first time) or `bin/kamal deploy`.
 
 Because the listeners publish host ports, Kamal's boot-new-before-stop

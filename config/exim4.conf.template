@@ -38,7 +38,15 @@ primary_hostname = @@EXIM_HELO_HOST@@
 # Domains we host. Used to tell, for an authenticated submission, a local
 # recipient (-> ingress) from a remote one (-> queue outbound), so mail to
 # our own users isn't looped back out through our MX.
-domainlist local_domains = @@EXIM_LOCAL_DOMAINS@@
+#
+# File-based lookup so the Rails app can add/remove hosted domains at
+# runtime: it rewrites this file (one domain per line) on the shared
+# mailconf volume, and Exim re-reads it per connection - no restart needed.
+# bin/entrypoint seeds it from EXIM_LOCAL_DOMAINS when absent (first boot).
+# A MISSING file defers matches (4xx, senders retry); an EMPTY file means
+# "no local domains" and 550s all inbound - the app refuses to write an
+# empty list.
+domainlist local_domains = lsearch;/var/lib/exim4/dynamic/local_domains
 
 # Listeners. Kamal publishes host 25/587/465 -> these container ports 1:1
 # (proxy: false in config/deploy.yml). 465 is implicit TLS.
