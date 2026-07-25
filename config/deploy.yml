@@ -83,9 +83,20 @@ env:
     EXIM_TLS_CERT: /etc/letsencrypt/live/mail.example.com/fullchain.pem
     EXIM_TLS_KEY: /etc/letsencrypt/live/mail.example.com/privkey.pem
 
-# Virus scanning (ClamAV) and spam filtering (rspamd) live with the Rails
-# app, not here - define those accessories in the app's own
-# config/deploy.yml. This service runs only Exim.
+    # DATA-time ClamAV scan: host:port of the app repo's clamav accessory,
+    # reached by container name over the shared "kamal" docker network (no
+    # host port is published). This is the real prod value - the accessory
+    # name is fixed by the app's service name, so no deploy.prod.yml
+    # override is needed. Empty/unset => no scanning (dev). When set the
+    # edge fails CLOSED: infected => 550, scanner down => 451 (senders
+    # retry).
+    EXIM_CLAMAV_ADDR: mail_on_rails-clamav:3310
+
+# The ClamAV and rspamd containers are the Rails app's Kamal accessories,
+# defined in the app's own config/deploy.yml. This service runs only Exim,
+# but it consults the app's clamav accessory at DATA time (EXIM_CLAMAV_ADDR
+# above) to reject infected mail before acceptance; the app then rescans on
+# ingress (defense in depth) and runs rspamd itself.
 
 aliases:
   logs: app logs -f

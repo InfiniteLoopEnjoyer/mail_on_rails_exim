@@ -13,6 +13,9 @@
 #     inbound recipients are first verified at RCPT time against the app
 #     (bin/rcpt-check): a domain we host with no such account gets 550, so
 #     unknown users bounce at the sender instead of being silently dropped.
+#     When EXIM_CLAMAV_ADDR is set, every completed message is also
+#     virus-scanned at DATA time (acl_data: infected -> 550, scanner
+#     down -> 451) before it is accepted and POSTed anywhere.
 #   - Authenticated submission to a REMOTE domain -> queued in the app via
 #     the internal API (bin/rails-outbound); the app DKIM-signs and sends.
 #     This is the only path that leaves for another server and it requires
@@ -59,8 +62,13 @@ tls_certificate = @@EXIM_TLS_CERT@@
 tls_privatekey  = @@EXIM_TLS_KEY@@
 tls_advertise_hosts = ${if eq{@@EXIM_TLS_CERT@@}{}{}{*}}
 
-# Match the app's 25 MB message cap.
-message_size_limit = 26214400
+# 24 MB, deliberately 1 MB under the app's 25 MB cap: clamd's stock
+# StreamMaxLength is exactly 25 MB (26214400), and both this edge's
+# DATA-time scan and the app's rescan stream the message WITH the
+# Received/stamped headers Exim adds. At exactly 25 MB the scan would
+# error and - fail-closed - defer forever; staying 1 MB under keeps a
+# max-size message inside the stream cap on both paths.
+message_size_limit = 25165824
 
 # --- Abuse / DoS limits ------------------------------------------------
 # Exim accepts every message and forwards each one to Rails (a Ruby spawn
@@ -98,6 +106,12 @@ log_file_path = /var/log/exim4/%slog
 
 acl_smtp_rcpt = acl_rcpt
 acl_smtp_auth = acl_auth
+acl_smtp_data = acl_data
+
+# DATA-time virus scanning. bin/entrypoint renders this to
+# `av_scanner = clamd:HOST PORT` when EXIM_CLAMAV_ADDR is set, or leaves
+# it empty (no scanning - dev default). See acl_data below.
+@@EXIM_AV_SCANNER@@
 
 
 #### ACL #############################################################
@@ -138,6 +152,19 @@ acl_rcpt:
   # Unauthenticated mail to a domain we don't host: relaying is not allowed
   # (this also never reaches the outbound router, which requires auth).
   deny   message = relaying not permitted
+
+# Runs once the whole message has arrived (DATA). The deny block is
+# substituted by bin/entrypoint: with EXIM_CLAMAV_ADDR set it is a
+# `deny malware = *` (fail CLOSED - a scanner error or timeout defers
+# with 451 and the sender retries; deliberately no defer_ok); unset it
+# renders empty and everything falls through to accept. This also scans
+# authenticated submissions, so outbound malware is stopped before it is
+# DKIM-signed and relayed. The app rescans on ingress (defense in
+# depth); no scan-verdict header is stamped here.
+acl_data:
+@@EXIM_MALWARE_DENY@@
+
+  accept
 
 # Throttle AUTH attempts per IP - each one spawns a Ruby check against the
 # app, so this caps both brute force and its amplification.

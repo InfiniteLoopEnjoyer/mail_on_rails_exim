@@ -12,12 +12,15 @@
 ARG RUBY_VERSION=4.0.6
 FROM docker.io/library/ruby:$RUBY_VERSION-slim AS base
 
-# Exim itself (the -light daemon is enough - no content scanning here) plus
-# CA certs so the Ruby helpers' HTTPS calls to the app verify. The package
-# creates the Debian-exim user/group. The helpers use only the Ruby
-# standard library, so there is no Gemfile / bundle step.
+# Exim with content scanning (the -heavy daemon: bin/entrypoint enables a
+# DATA-time ClamAV check via av_scanner/malware when EXIM_CLAMAV_ADDR is
+# set; heavy also pulls extra lookup/DB libs - a few tens of MB, accepted
+# for the native scan path) plus CA certs so the Ruby helpers' HTTPS calls
+# to the app verify. The package creates the Debian-exim user/group. The
+# helpers use only the Ruby standard library, so there is no
+# Gemfile / bundle step.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      exim4-daemon-light \
+      exim4-daemon-heavy \
       ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

@@ -14,7 +14,8 @@ require "fileutils"
 
 CONF = "/etc/exim4/exim4.conf"
 TEMPLATE = "/etc/exim4/exim4.conf.template"
-ALLOWED = %w[EXIM_HELO_HOST EXIM_TLS_CERT EXIM_TLS_KEY EXIM_TLS_HARDENING].freeze
+ALLOWED = %w[EXIM_HELO_HOST EXIM_TLS_CERT EXIM_TLS_KEY EXIM_TLS_HARDENING
+             EXIM_AV_SCANNER EXIM_MALWARE_DENY].freeze
 # Exim logs to files (it needs %s and won't write /dev/stdout); these three
 # are turned into FIFOs streamed to our stdout below - matches %slog in the
 # template's log_file_path.
@@ -35,6 +36,29 @@ ENV["EXIM_LOCAL_DOMAINS"] = ENV["EXIM_HELO_HOST"] if ENV["EXIM_LOCAL_DOMAINS"].t
 ENV["EXIM_TLS_CERT"]     ||= ""
 ENV["EXIM_TLS_KEY"]      ||= ""
 ENV["EXIM_TLS_HARDENING"]  = "" # set below, after we detect the TLS library
+
+# DATA-time virus scanning. EXIM_CLAMAV_ADDR (host:port, e.g.
+# mail_on_rails-clamav:3310 - same convention as the app's
+# SMTP_CLAMAV_ADDR) turns on clamd scanning; empty/unset renders both
+# placeholders blank (dev default: no scanning). Fail CLOSED: no
+# defer_ok, so a scanner error/timeout defers (451) instead of letting
+# the message through. Scan timeout is Exim's default (tmo=2m).
+clamav_addr = ENV["EXIM_CLAMAV_ADDR"].to_s.strip
+if clamav_addr.empty?
+  ENV["EXIM_AV_SCANNER"]   = ""
+  ENV["EXIM_MALWARE_DENY"] = ""
+else
+  # The regex doubles as config-injection protection (no newlines, list
+  # separators, or placeholder markers can reach the rendered config).
+  m = clamav_addr.match(/\A([A-Za-z0-9][A-Za-z0-9.-]*):(\d{1,5})\z/) ||
+      abort("entrypoint: EXIM_CLAMAV_ADDR must be host:port, got #{clamav_addr.inspect}")
+  ENV["EXIM_AV_SCANNER"]   = "av_scanner = clamd:#{m[1]} #{m[2]}"
+  ENV["EXIM_MALWARE_DENY"] = [
+    "  deny    malware     = *",
+    "          message     = message rejected: virus detected ($malware_name)",
+    "          log_message = malware detected: $malware_name"
+  ].join("\n")
+end
 
 # The config checks below open the logs, so the directory must exist first.
 FileUtils.mkdir_p(LOG_DIR)
@@ -80,6 +104,12 @@ template = File.read(TEMPLATE)
 # built against, which we use to pick the protocol-floor directive.
 render(template)
 report = `/usr/sbin/exim4 -bV 2>&1`
+# Checked before the generic abort: daemon-light chokes on av_scanner
+# itself, and this message says why.
+if !clamav_addr.empty? && !report.include?("Content_Scanning")
+  abort "entrypoint: EXIM_CLAMAV_ADDR is set but this Exim build lacks " \
+        "Content_Scanning - the image must install exim4-daemon-heavy (see Dockerfile)"
+end
 abort "entrypoint: exim config check failed:\n#{report}" unless $?.success?
 
 ENV["EXIM_TLS_HARDENING"] =

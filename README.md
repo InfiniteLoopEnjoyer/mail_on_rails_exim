@@ -16,23 +16,30 @@ installed on top. The helper scripts use only the Ruby standard library
 ```
    internet ──► Exim :25 (MX) ─┬─ RCPT ────► POST internal/rcpt_check     (bin/rcpt-check)
                                │              (unknown local user → 550)
-                               └─ DATA ────► POST relay ingress           (bin/rails-ingress)
+                               └─ DATA ────► clamd scan (infected → 550,
+                                             scanner down → 451)
+                                        └──► POST relay ingress           (bin/rails-ingress)
 
    iPhone / client ─► Exim :587/:465 ─┬─ AUTH ────► POST internal/authenticate  (bin/auth-check)
-                      (submission)     ├─ local ───► POST relay ingress          (bin/rails-ingress)
+                      (submission)     ├─ DATA ────► clamd scan (as above)
+                                       ├─ local ───► POST relay ingress          (bin/rails-ingress)
                                        └─ remote ──► POST internal/outbound_messages (bin/rails-outbound)
 ```
 
 - **Inbound (port 25).** Each recipient in a domain we host is verified at
   RCPT time against the app ([`bin/rcpt-check`](bin/rcpt-check)): an unknown
   local user gets `550` (so the sender's server bounces it) instead of being
-  accepted and silently dropped; an unreachable app defers with `451`. The
-  accepted message is then POSTed to the app's Action Mailbox **relay
+  accepted and silently dropped; an unreachable app defers with `451`. With
+  `EXIM_CLAMAV_ADDR` set, the completed message is then **virus-scanned at
+  DATA time** against clamd before acceptance — infected mail is rejected
+  with `550` (the sender's server carries the bounce) and a scanner outage
+  **fails closed** with `451` (senders retry; no unscanned mail enters).
+  Only then is the message POSTed to the app's Action Mailbox **relay
   ingress** ([`bin/rails-ingress`](bin/rails-ingress)), where Rails matches
-  recipients to local accounts and does virus + spam scanning. The internal
-  API is **required** — the edge refuses to start without it (see
-  [bin/entrypoint](bin/entrypoint)) — so there is no path that accepts a
-  recipient without verifying it.
+  recipients to local accounts and rescans for viruses (defense in depth)
+  plus spam. The internal API is **required** — the edge refuses to start
+  without it (see [bin/entrypoint](bin/entrypoint)) — so there is no path
+  that accepts a recipient without verifying it.
 - **Authenticated submission (587 STARTTLS / 465 implicit TLS).** This is
   the outgoing server an IMAP mail client (e.g. iPhone Mail) sends
   through. AUTH LOGIN/PLAIN credentials are checked against the app's
@@ -86,7 +93,9 @@ the app can skip inbound spoofing checks on it.
 ## Delivery guarantees
 
 Exim is store-and-forward: it accepts each message onto its own spool and
-returns `250` to the sender, then hands it to Rails from the queue. If
+returns `250` to the sender — but only after RCPT verification and, when
+scanning is enabled, a clean DATA-time virus scan — then hands it to Rails
+from the queue. If
 that handoff fails temporarily (app down, ingress 5xx, outbound queue full
 → HTTP 507) the helper exits `75`, so Exim keeps the message on its spool
 and **retries** on its normal schedule; a permanent rejection (4xx) exits
@@ -106,6 +115,7 @@ All configuration is environment variables (see
 | `INGRESS_URL` / `INGRESS_PASSWORD` | Relay ingress URL + `action_mailbox.ingress_password`. |
 | `INTERNAL_API_URL` / `INTERNAL_API_PASSWORD` | Internal API URL + `mail_on_rails.internal_api_password` (AUTH, outbound queueing, and inbound RCPT verification). **Required** — the entrypoint aborts if unset, since every inbound message is verified against it. |
 | `EXIM_TLS_CERT` / `EXIM_TLS_KEY` | PEM paths. Unset ⇒ no TLS advertised (dev only; AUTH is then not offered). |
+| `EXIM_CLAMAV_ADDR` | clamd `host:port` for DATA-time virus scanning (prod: the app's clamav accessory, `mail_on_rails-clamav:3310`, over the shared docker network). Unset ⇒ no scanning. When set the edge **fails closed**: infected ⇒ `550`, scanner down/timeout ⇒ `451` (senders retry). Requires the `-heavy` exim build (the entrypoint verifies `Content_Scanning` support and aborts otherwise). |
 
 The config file holds no secrets — the Ruby helpers read the passwords
 from the environment, which Exim passes to child processes via
@@ -126,6 +136,10 @@ docker run -d -p 25:25 -p 587:587 -p 465:465 \
   mail_on_rails_exim
 ```
 
+Add `-e EXIM_CLAMAV_ADDR=clamd.example.com:3310` to enable DATA-time virus
+scanning (the config check passes without contacting clamd; scans fail
+closed at runtime if it is unreachable).
+
 Validate the rendered config without starting the daemon:
 
 ```sh
@@ -138,11 +152,19 @@ docker run --rm -e EXIM_HELO_HOST=mail.example.com \
 
 ## Hardening
 
-Because Exim accepts every message and forwards each to Rails (a Ruby
-spawn + POST per message), and every AUTH attempt triggers a check, the
-main section and ACLs bound that funnel. All values live in
+Because Exim forwards each accepted message to Rails (a Ruby spawn + POST
+per message), and every AUTH attempt triggers a check, the main section
+and ACLs bound that funnel. All values live in
 [config/exim4.conf.template](config/exim4.conf.template) — tune them to
 your real traffic:
+
+- **DATA-time malware check, fail closed** (`acl_data`, when
+  `EXIM_CLAMAV_ADDR` is set): infected mail — inbound *and* authenticated
+  submission, so outbound malware is stopped before it is DKIM-signed —
+  gets `550` before acceptance; a clamd outage defers with `451`
+  (deliberately no `defer_ok`). `message_size_limit` sits 1 MB under
+  clamd's stock 25 MB `StreamMaxLength` so a max-size message stays
+  scannable.
 
 - **Connection/volume caps**: `smtp_accept_max` (100),
   `smtp_accept_max_per_host` (10), `smtp_accept_max_per_connection` (50),
@@ -225,7 +247,10 @@ by the `logging:` block in [config/deploy.yml](config/deploy.yml)
   the same way the mailroom routes them (stripped + lowercased).
 - Account matching + virus scanning + rspamd filtering in the mailroom,
   and the actual outbound send. ClamAV / rspamd run as the **app's** Kamal
-  accessories, not this service's.
+  accessories, not this service's — this edge consults the same clamav
+  accessory at DATA time (`EXIM_CLAMAV_ADDR`), so infected mail is normally
+  rejected before the app ever sees it; the app's rescan remains as defense
+  in depth and covers IMAP APPEND.
 - For SPF/DMARC on inbound mail, read `X-MailOnRails-Client-Ip`,
   `X-MailOnRails-Helo`, and `Return-Path` from the stamped message and
   pass them to rspamd (its `Ip`/`Helo`/`From` fields) — the app never sees
