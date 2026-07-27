@@ -10,9 +10,11 @@
 #   - Inbound (:25) and authenticated submission to a local domain -> the
 #     app's Action Mailbox relay ingress (bin/rails-ingress). Rails matches
 #     recipients to accounts and scans for viruses/spam. Unauthenticated
-#     inbound recipients are first verified at RCPT time against the app
-#     (bin/rcpt-check): a domain we host with no such account gets 550, so
-#     unknown users bounce at the sender instead of being silently dropped.
+#     inbound recipients are first verified at RCPT time against the
+#     local_recipients file the app maintains on the shared mailconf
+#     volume (no HTTP call): a domain we host with no such account gets
+#     550, so unknown users bounce at the sender instead of being silently
+#     dropped.
 #     When EXIM_CLAMAV_ADDR is set, every completed message is also
 #     virus-scanned at DATA time (acl_data: infected -> 550, scanner
 #     down -> 451) before it is accepted and POSTed anywhere.
@@ -130,21 +132,20 @@ acl_rcpt:
   accept authenticated = *
 
   # Unauthenticated (inbound MX) from here down. Verify each recipient in a
-  # domain we host against the app so unknown users get a proper 550 (the
-  # sender's server bounces) instead of being accepted and silently dropped.
-  # rcpt-check exits 0 (accept: real account), 1 (deny: no such account), or
-  # 2 (defer: app unreachable/unconfigured). Run it once per recipient and
-  # capture the exit code (the {}{} branches expand empty; $runrc holds the
-  # code right after the run).
-  warn   domains = +local_domains
-         set acl_m_rcpt_rc = ${run{/usr/local/bin/ruby /usr/local/bin/rcpt-check ${base64:$local_part@$domain}}{}{}}${runrc}
-
-  accept domains   = +local_domains
-         condition = ${if eq{$acl_m_rcpt_rc}{0}}
-
-  defer  domains   = +local_domains
-         condition = ${if eq{$acl_m_rcpt_rc}{2}}
-         message   = recipient verification temporarily unavailable, try again later
+  # domain we host so unknown users get a proper 550 (the sender's server
+  # bounces) instead of being accepted and silently dropped.
+  #
+  # Like local_domains above, this is a file the Rails app rewrites on the
+  # shared mailconf volume (one address per line, lowercased) on every
+  # account add/remove/rename - a plain lsearch here instead of the HTTP
+  # round trip to the app the edge used to make per RCPT. In an address
+  # list a bare lookup is keyed by the complete address, matched caselessly,
+  # so $local_part@$domain against the app's normalized lines just works.
+  # A MISSING file fails the lookup and DEFERS the RCPT (4xx, senders
+  # retry - same fail-safe as the old "app unreachable" path; the app seeds
+  # the file at boot); an EMPTY file means "no accounts" and 550s below.
+  accept domains    = +local_domains
+         recipients = lsearch;/var/lib/exim4/dynamic/local_recipients
 
   deny   domains = +local_domains
          message = no such user here

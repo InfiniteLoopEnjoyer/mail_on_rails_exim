@@ -14,8 +14,8 @@ installed on top. The helper scripts use only the Ruby standard library
 ## How mail flows
 
 ```
-   internet ──► Exim :25 (MX) ─┬─ RCPT ────► POST internal/rcpt_check     (bin/rcpt-check)
-                               │              (unknown local user → 550)
+   internet ──► Exim :25 (MX) ─┬─ RCPT ────► lsearch local_recipients     (shared volume,
+                               │              (unknown local user → 550)   written by the app)
                                └─ DATA ────► clamd scan (infected → 550,
                                              scanner down → 451)
                                         └──► POST relay ingress           (bin/rails-ingress)
@@ -27,9 +27,12 @@ installed on top. The helper scripts use only the Ruby standard library
 ```
 
 - **Inbound (port 25).** Each recipient in a domain we host is verified at
-  RCPT time against the app ([`bin/rcpt-check`](bin/rcpt-check)): an unknown
-  local user gets `550` (so the sender's server bounces it) instead of being
-  accepted and silently dropped; an unreachable app defers with `451`. With
+  RCPT time against the `local_recipients` file the Rails app maintains on
+  the shared mailconf volume (one lowercased address per line, rewritten on
+  every account change — no HTTP call): an unknown local user gets `550`
+  (so the sender's server bounces it) instead of being accepted and
+  silently dropped; a missing file (fresh volume, app not yet booted)
+  defers with `4xx`. With
   `EXIM_CLAMAV_ADDR` set, the completed message is then **virus-scanned at
   DATA time** against clamd before acceptance — infected mail is rejected
   with `550` (the sender's server carries the bounce) and a scanner outage
@@ -208,10 +211,6 @@ and exercises its pure methods directly.
 - `test/auth_check_test.rb` — AUTH is granted only on a 2xx with a
   non-null `account_id`; base64 arg-wrapping round-trips passwords with
   spaces; malformed/`null`/non-2xx responses deny.
-- `test/rcpt_check_test.rb` — a recipient is local only if the endpoint
-  echoes it back (matched case/space-insensitively); the URL never doubles
-  its slash; and with no internal API configured the check defers (exit 2)
-  rather than silently accepting a recipient it can't verify.
 
 ## Deploy with Kamal
 
@@ -246,9 +245,11 @@ by the `logging:` block in [config/deploy.yml](config/deploy.yml)
 - `action_mailbox.ingress_password` credential = `INGRESS_PASSWORD`.
 - `mail_on_rails.internal_api_password` credential (or
   `SMTP_INTERNAL_API_PASSWORD` env) = `INTERNAL_API_PASSWORD`, backing the
-  `authenticate`, `outbound_messages`, and `rcpt_check` endpoints. The last
-  echoes back which of the submitted addresses are local accounts, matched
-  the same way the mailroom routes them (stripped + lowercased).
+  `authenticate` and `outbound_messages` endpoints.
+- The `local_recipients` file on the shared mailconf volume (next to
+  `local_domains`), one lowercased address per line — the app rewrites it
+  on every account add/remove/rename and at boot, and `acl_rcpt` lsearches
+  it per RCPT, so recipient verification needs no HTTP call.
 - Account matching + virus scanning + rspamd filtering in the mailroom,
   and the actual outbound send. ClamAV / rspamd run as the **app's** Kamal
   accessories, not this service's — this edge consults the same clamav
