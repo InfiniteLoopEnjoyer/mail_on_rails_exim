@@ -73,7 +73,12 @@ env:
 
     # Inbound + local submission are POSTed to the app's relay ingress;
     # AUTH checks and outbound queueing go to the internal API. If the app
-    # is down the session answers a temporary failure.
+    # is down the session answers a temporary failure. When both containers
+    # share a docker network, prefer plain HTTP to a stable network-alias
+    # on the app container (traffic never leaves the host; Rails with
+    # config.assume_ssl skips the force_ssl redirect for direct calls):
+    #   http://mail_on_rails-web/rails/action_mailbox/relay/inbound_emails
+    #   http://mail_on_rails-web/mail_on_rails/internal
     INGRESS_URL: https://app.example.com/rails/action_mailbox/relay/inbound_emails
     INTERNAL_API_URL: https://app.example.com/mail_on_rails/internal
 
