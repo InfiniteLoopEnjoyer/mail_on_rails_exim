@@ -36,4 +36,29 @@ class AuthCheckTest < Minitest::Test
     refute AuthCheck.authenticated?(200, "not json")
     refute AuthCheck.authenticated?(200, "")
   end
+
+  # A throttled attempt comes back as a normal denial, so no special
+  # handling is needed here - but it must not be mistaken for a success.
+  def test_denied_when_the_app_reports_a_throttle
+    refute AuthCheck.authenticated?(200, '{"account_id":null,"email":null,"throttled":true,"retry_after":840}')
+  end
+
+  # The client address rides along as a third argument so the app can count
+  # brute-force attempts per source, and is omitted rather than sent blank
+  # when Exim has none (a locally submitted message).
+  def test_the_client_ip_is_sent_when_present
+    fields = AuthCheck.form_fields("bob@local.test", "pw", "203.0.113.9")
+    assert_equal "203.0.113.9", fields[:ip]
+  end
+
+  def test_a_blank_client_ip_is_omitted_entirely
+    refute_includes AuthCheck.form_fields("bob@local.test", "pw", "").keys, :ip
+    refute_includes AuthCheck.form_fields("bob@local.test", "pw", nil).keys, :ip
+  end
+
+  def test_credentials_are_always_sent
+    fields = AuthCheck.form_fields("bob@local.test", "pw", nil)
+    assert_equal "bob@local.test", fields[:email]
+    assert_equal "pw", fields[:password]
+  end
 end

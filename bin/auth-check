@@ -3,12 +3,18 @@
 
 # SMTP AUTH credential check, called from the plaintext authenticators:
 #
-#   auth-check <base64 email> <base64 password>
+#   auth-check <base64 email> <base64 password> [<base64 client ip>]
 #
 # The credentials arrive base64-wrapped because Exim splits the ${run}
 # command on whitespace, so a raw password with a space would be mangled.
 # They are verified against the app's internal API. Exit 0 = valid,
 # non-zero = denied.
+#
+# The client IP is what the app counts brute-force attempts against
+# (AuthThrottle), so SMTP AUTH and IMAP LOGIN share one budget. It is
+# optional: without it the app still throttles per account. A throttled
+# attempt comes back as a plain account_id:null denial, which needs no
+# special handling here.
 #
 # The pure bits (decode, authenticated?) are covered by
 # test/auth_check_test.rb; #main runs only when executed directly.
@@ -34,33 +40,48 @@ module AuthCheck
     false
   end
 
-  def self.post(base, api_password, email, password)
+  # Form fields for the credential check. The client IP is omitted rather
+  # than sent empty when Exim has none (locally submitted mail), so the app
+  # counts those against the account only. Pure.
+  def self.form_fields(email, password, ip)
+    fields = { email: email, password: password }
+    fields[:ip] = ip unless ip.to_s.empty?
+    fields
+  end
+
+  def self.post(base, api_password, email, password, ip = nil)
     uri = URI("#{base.to_s.sub(%r{/\z}, '')}/authenticate")
     request = Net::HTTP::Post.new(uri)
     request.basic_auth("mail_on_rails", api_password)
-    request.set_form_data(email: email, password: password)
+    request.set_form_data(form_fields(email, password, ip))
     Net::HTTP.start(uri.hostname, uri.port, use_ssl: uri.scheme == "https",
                     open_timeout: 5, read_timeout: 10, write_timeout: 10,
                     min_version: :TLS1_2) { |http| http.request(request) }
   end
 
-  # Returns the process exit code (0 valid, 1 denied).
+  # [base url, api password], or nil when either is unconfigured.
+  def self.api_config
+    base = ENV["INTERNAL_API_URL"].to_s
+    api_password = ENV["INTERNAL_API_PASSWORD"].to_s
+    return nil if base.empty? || api_password.empty?
+
+    [base, api_password]
+  end
+
+  # Returns the process exit code (0 valid, 1 denied). Anything unexpected -
+  # an unreachable app, a malformed reply - denies.
   def self.main(argv)
     email = decode(argv[0])
     password = decode(argv[1])
     return 1 if email.empty? || password.empty?
 
-    base = ENV["INTERNAL_API_URL"].to_s
-    api_password = ENV["INTERNAL_API_PASSWORD"].to_s
-    return 1 if base.empty? || api_password.empty?
+    base, api_password = api_config
+    return 1 unless base
 
-    begin
-      response = post(base, api_password, email, password)
-    rescue StandardError
-      return 1
-    end
-
+    response = post(base, api_password, email, password, decode(argv[2]))
     authenticated?(response.code, response.body) ? 0 : 1
+  rescue StandardError
+    1
   end
 end
 

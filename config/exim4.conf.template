@@ -265,12 +265,14 @@ begin authenticators
 # Credentials are verified against the app's internal API (bin/auth-check).
 # Only offered once TLS is up and never on port 25 (MX). auth values are
 # base64-wrapped through ${run} so passwords with spaces survive Exim's
-# whitespace-split of the command line.
+# whitespace-split of the command line. The sender's address goes along as
+# a third argument: the app throttles brute-force attempts per source IP
+# and per account, so SMTP AUTH and IMAP LOGIN share one budget.
 
 plain:
   driver                     = plaintext
   public_name                = PLAIN
-  server_condition           = ${run{/usr/local/bin/ruby /usr/local/bin/auth-check ${base64:$auth2} ${base64:$auth3}}{yes}{no}}
+  server_condition           = ${run{/usr/local/bin/ruby /usr/local/bin/auth-check ${base64:$auth2} ${base64:$auth3} ${base64:$sender_host_address}}{yes}{no}}
   server_set_id              = $auth2
   server_advertise_condition = ${if and{{def:tls_in_cipher}{!eq{$received_port}{25}}}{yes}{no}}
 
@@ -278,6 +280,6 @@ login:
   driver                     = plaintext
   public_name                = LOGIN
   server_prompts             = Username:: : Password::
-  server_condition           = ${run{/usr/local/bin/ruby /usr/local/bin/auth-check ${base64:$auth1} ${base64:$auth2}}{yes}{no}}
+  server_condition           = ${run{/usr/local/bin/ruby /usr/local/bin/auth-check ${base64:$auth1} ${base64:$auth2} ${base64:$sender_host_address}}{yes}{no}}
   server_set_id              = $auth1
   server_advertise_condition = ${if and{{def:tls_in_cipher}{!eq{$received_port}{25}}}{yes}{no}}
