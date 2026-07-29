@@ -24,6 +24,9 @@ require "uri"
 require "json"
 
 module AuthCheck
+  # Names this edge in the app's attempt log.
+  SOURCE = "smtp"
+
   # Decode one base64 command-line argument back to its plaintext.
   def self.decode(arg)
     arg.to_s.unpack1("m").to_s
@@ -44,7 +47,7 @@ module AuthCheck
   # than sent empty when Exim has none (locally submitted mail), so the app
   # counts those against the account only. Pure.
   def self.form_fields(email, password, ip)
-    fields = { email: email, password: password }
+    fields = { email: email, password: password, source: SOURCE }
     fields[:ip] = ip unless ip.to_s.empty?
     fields
   end

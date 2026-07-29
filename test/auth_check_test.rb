@@ -61,4 +61,10 @@ class AuthCheckTest < Minitest::Test
     assert_equal "bob@local.test", fields[:email]
     assert_equal "pw", fields[:password]
   end
+
+  # The edge names itself so the app's attempt log can tell SMTP AUTH
+  # failures apart from IMAP and web ones.
+  def test_the_edge_identifies_itself_as_smtp
+    assert_equal "smtp", AuthCheck.form_fields("bob@local.test", "pw", nil)[:source]
+  end
 end
