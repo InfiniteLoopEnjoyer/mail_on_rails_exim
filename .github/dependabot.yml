@@ -1,0 +1,16 @@
+version: 2
+# No bundler ecosystem: the helpers are stdlib-only, no Gemfile. The docker
+# ecosystem watching the digest-pinned ruby base image is the main event -
+# it is the only bot-driven update path this repo has (Trivy in ci.yml
+# detects, Dependabot remediates).
+updates:
+- package-ecosystem: github-actions
+  directory: "/"
+  schedule:
+    interval: weekly
+  open-pull-requests-limit: 10
+- package-ecosystem: docker
+  directory: "/"
+  schedule:
+    interval: weekly
+  open-pull-requests-limit: 10
