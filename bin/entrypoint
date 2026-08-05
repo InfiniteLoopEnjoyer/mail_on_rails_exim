@@ -84,6 +84,18 @@ unless File.exist?(DOMAINS_FILE)
   File.rename(tmp, DOMAINS_FILE)
 end
 
+# Rails-managed IP bans (acl_connect's host list). Seeded EMPTY when
+# absent, and only then: empty means "no bans", missing would error the
+# host-list check and defer every connection with 4xx - a fresh volume
+# must not boot into that state while the app has yet to write the file.
+BANNED_FILE = File.join(DOMAINS_DIR, "banned_ips")
+unless File.exist?(BANNED_FILE)
+  tmp = "#{BANNED_FILE}.seed.#{Process.pid}"
+  File.write(tmp, "")
+  File.chmod(0o644, tmp)
+  File.rename(tmp, BANNED_FILE)
+end
+
 def render(template)
   rendered = template.gsub(/@@(\w+)@@/) do
     name = Regexp.last_match(1)

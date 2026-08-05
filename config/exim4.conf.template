@@ -106,6 +106,7 @@ add_environment  = <; PATH=/usr/local/bin:/usr/bin:/bin
 # while nothing accumulates on disk (the pipes store nothing).
 log_file_path = /var/log/exim4/%slog
 
+acl_smtp_connect = acl_connect
 acl_smtp_rcpt = acl_rcpt
 acl_smtp_auth = acl_auth
 acl_smtp_data = acl_data
@@ -120,7 +121,30 @@ acl_smtp_data = acl_data
 
 begin acl
 
+# Admin-managed permanent bans (the Rails app's BannedIp - auth attempts
+# page plus the imported Spamhaus DROP list). One IP or CIDR per line on
+# the shared mailconf volume; an absolute filename as a host-list item is
+# re-read every time the list is checked, and the daemon forks per
+# connection, so a ban takes effect for new connections with no restart -
+# same contract as local_domains above. `drop` refuses the banner and
+# closes, the cheapest answer to a sustained attacker.
+#
+# The Rails app rewrites the file on every ban/unban; bin/entrypoint seeds
+# it EMPTY when absent because the two states differ: an EMPTY file means
+# "no bans" (the normal steady state), while a MISSING file errors the
+# host-list check and defers every connection with 4xx.
+acl_connect:
+  drop message = access denied
+       hosts   = /var/lib/exim4/dynamic/banned_ips
+
+  accept
+
 acl_rcpt:
+  # A connection established moments before its ban landed still gets cut
+  # at the next RCPT (SMTP connections are short-lived; belt and braces).
+  drop   message = access denied
+         hosts   = /var/lib/exim4/dynamic/banned_ips
+
   # Per-IP recipient rate limit - dictionary/flood control. Authenticated
   # submitters are exempt (a person's client, not a flood source).
   defer  message        = rate limit exceeded, slow down

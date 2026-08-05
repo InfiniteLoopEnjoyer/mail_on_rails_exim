@@ -250,6 +250,12 @@ by the `logging:` block in [config/deploy.yml](config/deploy.yml)
   `local_domains`), one lowercased address per line — the app rewrites it
   on every account add/remove/rename and at boot, and `acl_rcpt` lsearches
   it per RCPT, so recipient verification needs no HTTP call.
+- The `banned_ips` file on the same volume (one IP or CIDR per line) — the
+  app rewrites it on every ban/unban from its auth-attempts page (plus a
+  daily Spamhaus DROP import), and `acl_connect` drops matching
+  connections at banner time, re-read per connection with no restart. The
+  entrypoint seeds it empty when absent: an empty file means "no bans",
+  a missing one would defer every connection with 4xx.
 - Account matching + virus scanning + rspamd filtering in the mailroom,
   and the actual outbound send. ClamAV / rspamd run as the **app's** Kamal
   accessories, not this service's — this edge consults the same clamav
