@@ -11,7 +11,7 @@
 # Matches the app image's Ruby (see .ruby-version). Digest-pinned so builds
 # can't silently pick up whatever the tag points at; Dependabot (docker
 # ecosystem) PRs tag and digest bumps.
-FROM docker.io/library/ruby:4.0.6-slim@sha256:abd7528c4df35d151e2643d5efb845e442a26e36a4babc6459bee508619137a2 AS base
+FROM docker.io/library/ruby:4.0.7-slim@sha256:268a5add730705f1a6e2518737b3eb3fe6bd5007258f0ac9f09f6811c6025d88 AS base
 
 # Exim with content scanning (the -heavy daemon: bin/entrypoint enables a
 # DATA-time ClamAV check via av_scanner/malware when EXIM_CLAMAV_ADDR is
